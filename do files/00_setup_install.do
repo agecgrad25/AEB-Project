@@ -9,3 +9,8 @@ if _rc ssc install coefplot, replace
 
 quietly cap which dm
 if _rc ssc install dmariano, replace
+
+ssc install estout
+
+ssc install palettes
+ssc install colrspace

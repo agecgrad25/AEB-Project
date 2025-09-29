@@ -788,3 +788,57 @@ tsset mdate, monthly
 save "$PROC\vix_monthly.dta", replace
 display as text "VIX monthly mean saved to $PROC\vix_monthly.dta"
 }
+
+*Deere Stock Price 
+import excel "$RAW\DEStockPrice.xlsx"
+list in 1/4
+
+* Assume current vars are A and B, with row 1 holding header text
+
+* 1) Rename columns using row-1 labels and drop the header row
+rename A PricingDate
+rename B SharePricing
+drop in 1
+
+* 2) Convert PricingDate ("02jan1968") to a proper daily date
+capture confirm string variable PricingDate
+if !_rc {
+    gen double _d = date(PricingDate, "DMY")
+    format _d %td
+    drop PricingDate
+    rename _d PricingDate
+}
+else {
+    * if it's already numeric, just ensure date format
+    format PricingDate %td
+}
+
+* 3) Ensure SharePricing is numeric double
+capture confirm numeric variable SharePricing
+if _rc destring SharePricing, replace force
+recast double SharePricing
+label var SharePricing "NYSE:DE - Share Pricing"
+*Cleaning 
+order PricingDate, first
+
+* Assume: PricingDate = %td daily, SharePricing = double
+
+* 1) Monthly index
+gen mdate = mofd(PricingDate)
+format mdate %tm
+label var mdate "Month (YYYY-MM)"
+
+* 2) Keep last trading day of each month (EOM)
+bysort mdate (PricingDate): keep if _n == _N
+
+* 3) (Optional) restrict to 2015m1+
+drop if mdate < tm(2015m1)
+
+* 4) Finalize
+rename SharePricing EOM_Close
+order mdate PricingDate EOM_Close
+tsset mdate, monthly
+drop PricingDate
+
+ save "$PROC\DE_monthly.dta", replace
+display as text "DE EOM Price saved to $PROC\DE_monthly.dta"
