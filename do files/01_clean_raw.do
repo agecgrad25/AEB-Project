@@ -12,7 +12,7 @@ set more off
 *-----------------------------
 * AEB + subindices (monthly) from Excel
 *-----------------------------
-{
+
 import excel "$RAW\aebd.xlsx", firstrow clear
 list in 1/5
 
@@ -44,17 +44,14 @@ label var IFE "Index of Future Expectations"
 * 7) Set time series structure on the monthly date
 tsset mdate, monthly
 
-
-
-
 save "$PROC\aeb_monthly.dta", replace
-}
+
 *-----------------------------
 * (rest of your script continues…)
 * Benchmarks (monthly): MCSI, CCI, partisan (R/D), EPU, TradeEPU
 *-----------------------------
 *MCSI 
-{
+
 	import delimited using "$RAW\UMCSENT.csv", ///
     varnames(1) case(preserve) clear
 list in 1/4
@@ -117,9 +114,10 @@ tsset mdate, monthly
 
 * 6) Save to Processed (requires $PROC from master.do)
 capture noisily save "$PROC\umcsent_monthly.dta", replace 
-}
+
+
 *CCI
-{
+
 *------------------------------------------------------------
 * CCIMo: fix percent columns that import as text
 *   Expected columns (from your screenshot):
@@ -187,7 +185,7 @@ label var AnnualRatePercent       "Annual rate (pct-pts)"
 tsset mdate, monthly
 
 * Optional: keep only what you want
-keep mdate Value SimpleGrowthRatePercent YoYChangePercent AnnualRatePercent
+keep mdate Value 
 
 * --- Find first uninterrupted monthly segment for CCI and keep only that tail ---
 sort mdate
@@ -199,11 +197,8 @@ drop if mdate < tm(1980m1)
 * Save to Processed
 save "$PROC\cci_monthly.dta", replace
 
-}
+
 *Partisan MCSI
-{
-
-
 * 1) Import as strings so header rows (1–3) are preserved
 import excel "$RAW\redbk05b.xls", allstring clear    // change path/sheet if needed
 * e.g., add: sheet("Sheet1")
@@ -288,7 +283,7 @@ order mdate, first
 
 * (optional) clean up
 drop _d
-drop Period Year   // uncomment if you don't need the originals
+drop Period Year // uncomment if you don't need the originals
 
 * (optional) declare monthly time scale like AEB
 tsset mdate, monthly
@@ -313,11 +308,14 @@ foreach v of local tofix {
     }
 }
 
+drop col12 
+drop col13 col14 col15 col16 col17 col18 col19 _mon 
+
+
 save "$PROC\partisan_monthly.dta", replace
 
-}
 *USEPU
-{
+
 	version 19
 *==============================================================
 * US EPU cleaning — USEPU.xlsx
@@ -403,9 +401,9 @@ save "$PROC\USEPU_clean.dta", replace
 
 display as text "US EPU cleaned: saved USEPU_clean.dta"
 	
-}
+
 * GEPU
-{
+
 	version 19
 *==============================================================
 * Global EPU cleaning — GEPU.xlsx
@@ -467,7 +465,7 @@ foreach v of local tofix {
 
 * --- Ensure one obs per month; if duplicates exist, keep last by source date ---
 bysort mdate (Period): keep if _n == _N
-
+drop Period GEPU_ppp
 * --- Optional quick checks ---
 * assert !missing(Period) & !missing(mdate)
 * duplicates report mdate
@@ -477,10 +475,8 @@ export delimited using "$PROC\GEPUClean.csv", replace
 save "$PROC\GEPU_clean.dta", replace
 
 display as text "Global EPU cleaned: saved to $PROC\GEPUClean.csv and GEPU_clean.dta"
-}
+
 * TPU
-{
-version 19
 *==============================================================
 * TPU cleaning — tpu_web_latest.xlsx (sheet 4)
 *==============================================================
@@ -552,7 +548,7 @@ drop if missing(Date) | missing(TPU)
 
 * --- Ensure one obs per month; keep last if duplicates ---
 bysort mdate (Date): keep if _n == _N
-
+drop Date
 * --- Optional checks ---
 * describe
 * list in 1/10
@@ -563,10 +559,8 @@ export delimited using "$PROC\TPUClean.csv", replace
 save "$PROC\TPU_clean.dta", replace
 
 display as text "TPU cleaned: saved to $PROC\TPUClean.csv and TPU_clean.dta"
-}
-*NFIB 
-{
 
+*NFIB 
 * ==============================================================
 * NFIB Uncertainty — "NFIBUncertainty.xlsx"
 * ==============================================================
@@ -604,7 +598,7 @@ gen mdate = mofd(Date)
 format mdate %tm
 label var mdate "Month (YYYY-MM)"
 order Date mdate, first
-
+drop Date
 * Export
 export delimited using "$PROC\NFIBUClean.csv", replace
 save "$PROC\NFIBU_clean.dta", replace
@@ -685,6 +679,7 @@ else {
     }
 }
 label var SBOI "Small Business Optimism Index"
+drop Date
 
 * Export
 export delimited using "$PROC\NFIBOClean.csv", replace
@@ -692,14 +687,9 @@ save "$PROC\NFIBO_clean.dta", replace
 
 display as text "NFIB cleaned: saved to $PROC\NFIBUClean.csv / NFIBU_clean.dta and $PROC\NFIBOClean.csv / NFIBO_clean.dta"
 
-}
-
-
-
 *-----------------------------
 * VIX (daily) -> monthly mean
 *-----------------------------
-{
 import excel "$RAW\VIX.xls", sheet("Chart Data") firstrow clear
 
 * --- Parse PricingDate to daily %td, handling strings or Excel serials ---
@@ -787,7 +777,7 @@ tsset mdate, monthly
 
 save "$PROC\vix_monthly.dta", replace
 display as text "VIX monthly mean saved to $PROC\vix_monthly.dta"
-}
+
 
 *Deere Stock Price 
 import excel "$RAW\DEStockPrice.xlsx"
@@ -842,3 +832,178 @@ drop PricingDate
 
  save "$PROC\DE_monthly.dta", replace
 display as text "DE EOM Price saved to $PROC\DE_monthly.dta"
+
+
+
+version 19
+clear
+set more off
+
+*============ Helpers ============*
+
+capture program drop _ensure_mdate_first
+program define _ensure_mdate_first
+    * assumes current data are loaded
+    capture confirm variable mdate
+    if _rc {
+        capture confirm variable Date
+        if !_rc {
+            gen mdate = mofd(Date)
+        }
+    }
+    capture confirm variable mdate
+    if _rc {
+        di as err "  -> No mdate present/could not be created."
+        exit 459
+    }
+    format mdate %tm
+    capture drop Period Year Month YearMonth Date
+    order mdate, first
+    duplicates drop mdate, force
+end
+
+capture program drop _open_any_as_dta
+program define _open_any_as_dta, rclass
+    * open a file with proper importer, then return a tempfile DTA path
+    syntax, path(string)
+    preserve
+        quietly {
+            local p "`path'"
+            local lower = lower("`p'")
+            if regexm("`lower'","\.(dta)$") {
+                use "`p'", clear
+            }
+            else if regexm("`lower'","\.(csv)$") {
+                import delimited using "`p'", varnames(1) clear
+            }
+            else if regexm("`lower'","\.(xls|xlsx)$") {
+                import excel "`p'", firstrow clear
+            }
+            else {
+                di as err "Unknown file type: `p'"
+                restore
+                exit 198
+            }
+            tempfile _tmpdta
+            save "`_tmpdta'", replace
+            return local dta "`_tmpdta'"
+        }
+    restore
+end
+
+*============ 1) Resolve USEPU master ============*
+
+* ensure $PROC exists
+local _proclen : length global PROC
+if `_proclen'==0 {
+    di as err "Global $PROC is not set. Run master.do first."
+    exit 9
+}
+
+* try common USEPU filenames; first existing becomes master
+local master ""
+foreach cand in ///
+    "$PROC\USEPU_clean.dta" ///
+    "$PROC\USEPU_Clean.dta" ///
+    "$PROC\USEPUClean.dta" ///
+    "$PROC\USEPUClean.csv"  ///
+    "$PROC\USEPU.csv"       ///
+    "$PROC\USEPU.xlsx"      ///
+    "$PROC\USEPU.xls" {
+    capture confirm file "`cand'"
+    if !_rc {
+        local master "`cand'"
+        local found 1
+    }
+    if "`found'"=="1" continue
+}
+
+if "`master'"=="" {
+    di as err "Could not find a USEPU file in $PROC. Please confirm filename."
+    dir "$PROC", files
+    exit 601
+}
+
+di as txt "Using USEPU master:  `master'"
+
+* open master (regardless of extension), normalize, save to tempfile MASTER
+quietly _open_any_as_dta, path("`master'")
+local MASTER_SRC = r(dta)
+use "`MASTER_SRC'", clear
+quietly _ensure_mdate_first
+tempfile MASTER
+save "`MASTER'", replace
+
+*============ 2) Other files to merge ============*
+
+local files  ///
+    "$PROC\aeb_monthly.dta" ///
+    "$PROC\umcsent_monthly.dta" ///
+    "$PROC\cci_monthly.dta" ///
+    "$PROC\DE_monthly.dta" ///
+    "$PROC\GEPU_clean.dta" ///
+    "$PROC\TPU_clean.dta" ///
+    "$PROC\NFIBO_clean.dta" ///
+    "$PROC\NFIBU_clean.dta" ///
+    "$PROC\partisan_monthly.dta" ///
+    "$PROC\vix_monthly.dta"
+
+*============ 3) Loop, verify mdate first, merge to USEPU timeline ============*
+
+foreach f in `files' {
+    capture confirm file `"`f'"'
+    if _rc {
+        di as err "Skipping (missing): `f'"
+        continue
+    }
+
+    * open each file (dta/csv/xls/xlsx), normalize, stash to tempfile U
+    quietly _open_any_as_dta, path("`f'")
+    local U_SRC = r(dta)
+
+    preserve
+        use "`U_SRC'", clear
+        quietly _ensure_mdate_first
+
+        * light standardizations by filename (only if vars exist)
+        if strpos(lower("`f'"),"cci") {
+            capture confirm variable Value
+            if !_rc rename Value CCI_Value
+        }
+        if strpos(lower("`f'"),"de_") | strpos(lower("`f'"),"de_monthly") {
+            capture confirm variable EOM_Close
+            if !_rc rename EOM_Close DE_EOM
+            else {
+                capture confirm variable SharePricing
+                if !_rc rename SharePricing DE_EOM
+            }
+        }
+        if strpos(lower("`f'"),"nfibo") {
+            capture rename Small_Business_Optimism_Index SBOI
+        }
+        if strpos(lower("`f'"),"vix") {
+            capture confirm variable vix
+            if !_rc label var vix "VIX monthly mean"
+        }
+
+        tempfile U
+        save "`U'", replace
+    restore
+
+    * merge onto USEPU timeline
+    use "`MASTER'", clear
+    di as txt "Merging by mdate: `f'"
+    merge 1:1 mdate using "`U'", nogen keep(master match)
+    save "`MASTER'", replace
+}
+
+*============ 4) Save final ============*
+
+use "`MASTER'", clear
+order mdate, first
+compress
+label data "first corrs — merged on USEPU mdate timeline"
+save "$PROC\first corrs.dta", replace
+export delimited using "$PROC\first corrs.csv", replace
+
+di as result "✅ Saved: $PROC\first corrs.dta  (+ CSV)"
