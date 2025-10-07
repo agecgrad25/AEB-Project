@@ -116,86 +116,67 @@ tsset mdate, monthly
 capture noisily save "$PROC\umcsent_monthly.dta", replace 
 
 
-*CCI
+* CCI (minimal: keep only Period + Value up front)
 
-*------------------------------------------------------------
-* CCIMo: fix percent columns that import as text
-*   Expected columns (from your screenshot):
-*   Period | Value | Simple Growth Rate % | Y-o-Y Change % | Annual % Rate | Type
-*------------------------------------------------------------
-import excel "$RAW\CCIMo.xlsx", firstrow clear   // use the actual filename/ext
-list in 1/4
+import excel "$RAW\CCIMo.xlsx", firstrow clear
 
+* --- Keep only the two needed columns right away ---
+keep Period Value
 
-* --- Date: Period (daily) -> monthly ---
+* --- Make Value numeric (string -> double if needed) ---
+if substr("`: type Value'",1,3)=="str" {
+    replace Value = subinstr(Value, char(160), "", .)
+    replace Value = strtrim(itrim(Value))
+    replace Value = subinstr(Value, ",", "", .)
+    replace Value = subinstr(Value, "$", "", .)
+    replace Value = subinstr(Value, "%", "", .)
+    replace Value = subinstr(Value, "(", "-", .)
+    replace Value = subinstr(Value, ")", "", .)
+    replace Value = "" if inlist(upper(Value), "NA","N/A","NULL",".","")
+    destring Value, replace force
+}
+recast double Value
+
+* --- Build monthly key from Period ---
 capture confirm numeric variable Period
 if !_rc {
-    // Period is numeric; if it's %td, this works directly
     local f : format Period
     if strpos("`f'","%td") {
         gen mdate = mofd(Period)
     }
     else {
-        // numeric but not %td: treat as Excel serial just in case
         gen mdate = mofd(Period + td(1899,12,30))
     }
 }
 else {
-    // Period is string (fallback): handle "31aug2025" or "Aug-31-2025"
-    gen ddate = daily(Period,"DMY")
-    replace ddate = daily(Period,"MDY") if missing(ddate)
-    format ddate %td
-    gen mdate = mofd(ddate)
-    drop ddate
+    gen double __dd = daily(Period,"DMY")
+    replace __dd = daily(Period,"MDY") if missing(__dd)
+    format __dd %td
+    gen mdate = mofd(__dd)
+    drop __dd
 }
 format mdate %tm
+
+* --- Finalize monthly series ---
 order mdate, first
-
-* --- Rename the percent columns (they're showing as Simple~e, YoYCha~e, Annual~e) ---
-capture confirm variable SimpleGrowthRatePercent
-if _rc {
-    rename Simple*  SimpleGrowthRatePercent
-    rename YoYCha*  YoYChangePercent
-    rename Annual*  AnnualRatePercent
-}
-
-* --- Clean the percent strings: "(1.32)%" -> -1.32 ; "3.68%" -> 3.68 ---
-foreach v in SimpleGrowthRatePercent YoYChangePercent AnnualRatePercent {
-    capture confirm variable `v'
-    if !_rc {
-        replace `v' = subinstr(`v', char(160), "", .)
-        replace `v' = strtrim(`v')
-        replace `v' = subinstr(`v', "(", "-", .)
-        replace `v' = subinstr(`v', ")", "", .)
-        replace `v' = subinstr(`v', "%", "", .)
-        destring `v', replace force
-        // If you prefer proportions instead of pct-pts, also do:  gen double `v'_p = `v'/100
-    }
-}
-
-* (Optional) tidy up and declare time index
-tsset mdate, monthly
-
-
-label var SimpleGrowthRatePercent "Simple growth rate (pct-pts)"
-label var YoYChangePercent        "Year-over-year change (pct-pts)"
-label var AnnualRatePercent       "Annual rate (pct-pts)"
-
-* You can drop helper/date originals if not needed
-tsset mdate, monthly
-
-* Optional: keep only what you want
-keep mdate Value 
-
-* --- Find first uninterrupted monthly segment for CCI and keep only that tail ---
+duplicates drop mdate, force
 sort mdate
-
-* All columns do not begin to have data until 1980
 drop if mdate < tm(1980m1)
 
+* Keep just the monthly key and the value
+keep mdate Value
+tsset mdate, monthly
+compress
+
+* --- Rename + label (no spaces in Stata var names) ---
+rename Value CCI_monthly
+label var CCI_monthly "CCI monthly"
 
 * Save to Processed
 save "$PROC\cci_monthly.dta", replace
+
+
+
 
 
 *Partisan MCSI
@@ -833,177 +814,28 @@ drop PricingDate
  save "$PROC\DE_monthly.dta", replace
 display as text "DE EOM Price saved to $PROC\DE_monthly.dta"
 
-
-
-version 19
-clear
-set more off
-
-*============ Helpers ============*
-
-capture program drop _ensure_mdate_first
-program define _ensure_mdate_first
-    * assumes current data are loaded
-    capture confirm variable mdate
-    if _rc {
-        capture confirm variable Date
-        if !_rc {
-            gen mdate = mofd(Date)
-        }
-    }
-    capture confirm variable mdate
-    if _rc {
-        di as err "  -> No mdate present/could not be created."
-        exit 459
-    }
-    format mdate %tm
-    capture drop Period Year Month YearMonth Date
-    order mdate, first
-    duplicates drop mdate, force
-end
-
-capture program drop _open_any_as_dta
-program define _open_any_as_dta, rclass
-    * open a file with proper importer, then return a tempfile DTA path
-    syntax, path(string)
-    preserve
-        quietly {
-            local p "`path'"
-            local lower = lower("`p'")
-            if regexm("`lower'","\.(dta)$") {
-                use "`p'", clear
-            }
-            else if regexm("`lower'","\.(csv)$") {
-                import delimited using "`p'", varnames(1) clear
-            }
-            else if regexm("`lower'","\.(xls|xlsx)$") {
-                import excel "`p'", firstrow clear
-            }
-            else {
-                di as err "Unknown file type: `p'"
-                restore
-                exit 198
-            }
-            tempfile _tmpdta
-            save "`_tmpdta'", replace
-            return local dta "`_tmpdta'"
-        }
-    restore
-end
-
-*============ 1) Resolve USEPU master ============*
-
-* ensure $PROC exists
-local _proclen : length global PROC
-if `_proclen'==0 {
-    di as err "Global $PROC is not set. Run master.do first."
-    exit 9
-}
-
-* try common USEPU filenames; first existing becomes master
-local master ""
-foreach cand in ///
-    "$PROC\USEPU_clean.dta" ///
-    "$PROC\USEPU_Clean.dta" ///
-    "$PROC\USEPUClean.dta" ///
-    "$PROC\USEPUClean.csv"  ///
-    "$PROC\USEPU.csv"       ///
-    "$PROC\USEPU.xlsx"      ///
-    "$PROC\USEPU.xls" {
-    capture confirm file "`cand'"
-    if !_rc {
-        local master "`cand'"
-        local found 1
-    }
-    if "`found'"=="1" continue
-}
-
-if "`master'"=="" {
-    di as err "Could not find a USEPU file in $PROC. Please confirm filename."
-    dir "$PROC", files
-    exit 601
-}
-
-di as txt "Using USEPU master:  `master'"
-
-* open master (regardless of extension), normalize, save to tempfile MASTER
-quietly _open_any_as_dta, path("`master'")
-local MASTER_SRC = r(dta)
-use "`MASTER_SRC'", clear
-quietly _ensure_mdate_first
-tempfile MASTER
-save "`MASTER'", replace
-
-*============ 2) Other files to merge ============*
-
-local files  ///
-    "$PROC\aeb_monthly.dta" ///
-    "$PROC\umcsent_monthly.dta" ///
-    "$PROC\cci_monthly.dta" ///
-    "$PROC\DE_monthly.dta" ///
-    "$PROC\GEPU_clean.dta" ///
-    "$PROC\TPU_clean.dta" ///
-    "$PROC\NFIBO_clean.dta" ///
-    "$PROC\NFIBU_clean.dta" ///
-    "$PROC\partisan_monthly.dta" ///
-    "$PROC\vix_monthly.dta"
-
-*============ 3) Loop, verify mdate first, merge to USEPU timeline ============*
-
-foreach f in `files' {
-    capture confirm file `"`f'"'
-    if _rc {
-        di as err "Skipping (missing): `f'"
-        continue
-    }
-
-    * open each file (dta/csv/xls/xlsx), normalize, stash to tempfile U
-    quietly _open_any_as_dta, path("`f'")
-    local U_SRC = r(dta)
-
-    preserve
-        use "`U_SRC'", clear
-        quietly _ensure_mdate_first
-
-        * light standardizations by filename (only if vars exist)
-        if strpos(lower("`f'"),"cci") {
-            capture confirm variable Value
-            if !_rc rename Value CCI_Value
-        }
-        if strpos(lower("`f'"),"de_") | strpos(lower("`f'"),"de_monthly") {
-            capture confirm variable EOM_Close
-            if !_rc rename EOM_Close DE_EOM
-            else {
-                capture confirm variable SharePricing
-                if !_rc rename SharePricing DE_EOM
-            }
-        }
-        if strpos(lower("`f'"),"nfibo") {
-            capture rename Small_Business_Optimism_Index SBOI
-        }
-        if strpos(lower("`f'"),"vix") {
-            capture confirm variable vix
-            if !_rc label var vix "VIX monthly mean"
-        }
-
-        tempfile U
-        save "`U'", replace
-    restore
-
-    * merge onto USEPU timeline
-    use "`MASTER'", clear
-    di as txt "Merging by mdate: `f'"
-    merge 1:1 mdate using "`U'", nogen keep(master match)
-    save "`MASTER'", replace
-}
-
-*============ 4) Save final ============*
-
-use "`MASTER'", clear
+use `"$PROC\aeb_monthly.dta"', clear
+keep mdate AEB
+format mdate %tm
 order mdate, first
+duplicates drop mdate, force
+sort mdate
 compress
-label data "first corrs — merged on USEPU mdate timeline"
-save "$PROC\first corrs.dta", replace
-export delimited using "$PROC\first corrs.csv", replace
+save `"$PROC\aeb_monthly_AEBonly.dta"', replace
+export delimited using `"$PROC\aeb_monthly_AEBonly.csv"', replace
 
-di as result "✅ Saved: $PROC\first corrs.dta  (+ CSV)"
+* Build a slim copy of partisan_monthly with mdate + SI_* only
+use `"$PROC\partisan_monthly.dta"', clear
+keep mdate SI_Dem SI_Ind SI_Rep   // note: if named differently, adjust here
+format mdate %tm
+order mdate, first
+duplicates drop mdate, force
+sort mdate
+compress
+save `"$PROC\partisan_monthly_SIonly.dta"', replace
+export delimited using `"$PROC\partisan_monthly_SIonly.csv"', replace
+
+
+
+
+
