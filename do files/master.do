@@ -22,6 +22,7 @@ log using "$DOC\runlog.smcl", replace
 
 do "$CODE\00_setup_install.do"
 do "$CODE\01_clean_raw.do"
+do "$CODE\01.5_Merge.do"
 do "$CODE\02_build_panels.do"
 do "$CODE\03_analysis.do"
 do "$CODE\04_export_outputs.do"
