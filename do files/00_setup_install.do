@@ -14,3 +14,6 @@ ssc install estout
 
 ssc install palettes
 ssc install colrspace
+
+ssc install rforest, replace 
+

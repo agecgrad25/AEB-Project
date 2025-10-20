@@ -835,7 +835,102 @@ compress
 save `"$PROC\partisan_monthly_SIonly.dta"', replace
 export delimited using `"$PROC\partisan_monthly_SIonly.csv"', replace
 
+*------
+*	CORN AND BEANS VOL
+* --- Step 1: Import 'cornprices' and skip first 27 rows ---
+version 19
+clear all
+set more off
+
+* Point to the file (assumes you've set $RAW elsewhere)
+local infile "$RAW\cornprices.xlsx"
+
+* If the header row starts at Excel row 28, this reads from A28 onward
+* and uses that row as variable names.
+import excel using "`infile'", cellrange(A28) firstrow clear
+* Sanity check
+describe
+count
+
+* --- Step 2: Fix ExchangeDate to a Stata daily date (%td) ---
+
+* Keep original Excel serial (just in case)
+rename ExchangeDate ExchangeDate_excel
+
+* Convert Excel serial -> Stata daily date (Excel1900 base -> subtract 21916)
+gen double ExchangeDate = floor(ExchangeDate_excel) - 21916
+format %td ExchangeDate
+label var ExchangeDate "Date (Stata daily, from Excel serial)"
+order ExchangeDate ExchangeDate_excel
+
+* Quick sanity check
+sort ExchangeDate
+list ExchangeDate Close in 1/5, noobs
 
 
+*Volatility Calcs Close-Close
+* --- Option A (Close-to-Close) with the sorting fix ---
+tsset ExchangeDate, daily
 
+capture drop mdate r N sd_r vol_cc_month vol_cc_ann
+gen mdate = mofd(ExchangeDate)
+format %tm mdate
 
+* daily log return (uses tsset so L.Close is valid)
+gen double r = ln(Close / L.Close)
+drop if missing(r)
+
+* FIX: use bysort (auto-sorts by mdate)
+bysort mdate: egen N    = count(r)
+bysort mdate: egen sd_r = sd(r)
+
+* monthly-horizon and annualized volatility
+gen double vol_cc_month = sd_r*sqrt(N)
+gen double vol_cc_ann   = sd_r*sqrt(252)
+
+* collapse to one row per month
+bysort mdate (ExchangeDate): keep if _n==_N
+keep mdate vol_cc_month vol_cc_ann
+
+save "$PROC\cornvol.dta", replace
+
+*Beans
+* --- Import 'sbprices' and skip first 32 rows (headers at row 28) ---
+local infile "$RAW\sbprices.xlsx"
+import excel using "`infile'", cellrange(A33) firstrow clear
+
+* Sanity check
+describe
+count
+
+* --- Step 2: Fix ExchangeDate to a Stata daily date (%td) ---
+rename ExchangeDate ExchangeDate_excel
+gen double ExchangeDate = floor(ExchangeDate_excel) - 21916
+format %td ExchangeDate
+label var ExchangeDate "Date (Stata daily, from Excel serial)"
+order ExchangeDate ExchangeDate_excel
+
+* Quick sanity check
+sort ExchangeDate
+list ExchangeDate Close in 1/5, noobs
+
+* --- Volatility Calcs: Close-to-Close (Option A) ---
+tsset ExchangeDate, daily
+
+capture drop mdate r N sd_r vol_cc_month vol_cc_ann
+gen mdate = mofd(ExchangeDate)
+format %tm mdate
+
+gen double r = ln(Close / L.Close)
+drop if missing(r)
+
+bysort mdate: egen N    = count(r)
+bysort mdate: egen sd_r = sd(r)
+
+gen double vol_cc_month = sd_r*sqrt(N)
+gen double vol_cc_ann   = sd_r*sqrt(252)
+
+bysort mdate (ExchangeDate): keep if _n==_N
+keep mdate vol_cc_month vol_cc_ann
+
+save "$PROC\sbvol.dta", replace

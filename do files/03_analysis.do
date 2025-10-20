@@ -602,3 +602,194 @@ foreach which in raw z {
     }
 }
 
+clear
+*******************************************************
+* 6) OLS: pc_AEB_aeb ~ all other percent-change vars
+*******************************************************
+
+* Load pct-change dataset
+use "$PROC\firstcorrsv2_post2014_pctchg.dta", clear
+format mdate %tm
+tsset mdate, monthly
+
+* --- Hard-coded varlists ---
+local y  pc_AEB_aeb
+
+* Exclude mdate and pc_mdate; include all other pc_* vars
+local X  ///
+    pc_News_Based_Policy_Uncert_Inde ///
+    pc_SI_Dem_part ///
+    pc_SI_Ind_part ///
+    pc_SI_Rep_part ///
+    pc_CCI_monthly_cci ///
+    pc_UMCSENT_umc ///
+    pc_EOM_Close_de ///
+    pc_GEPU_current_gepu ///
+    pc_TPU_tpu ///
+    pc_SBOI_nfibo ///
+    pc_UncertaintyIndex_nfibu ///
+    pc_vix_vix ///
+	S1 ///
+	C1 ///
+	S2 ///
+	C2 ///
+	
+
+* Quick check: drop AEB from RHS if it slipped in
+local X : list X - `y'
+
+* Run regression (HC1 robust SEs)
+regress `y' `X', vce(robust)
+
+* (Optional) multicollinearity check
+estat vif
+
+
+*---------------------------------------------------------------
+* 7) Random Forest (rforest) on percent-change data (with seasonality & lags)
+*     y = pc_AEB_aeb ; X = other pc_* vars + Fourier seasonality + target lags
+*     - time-aware split: last 24 months = TEST
+*     - handles missing y by restricting training/eval to observed y
+*     - prints OOB RMSE, TEST MAE/RMSE, TEST R^2, TEST MAPE
+*     - compares to naive-1M and seasonal-12M baselines
+*     - saves predictions and variable importance to PROC/TAB
+*---------------------------------------------------------------
+
+* Load data and declare monthly time
+use "$PROC\firstcorrsv2_post2014_pctchg.dta", clear
+format mdate %tm
+tsset mdate, monthly
+
+* ---- Hard-coded varlists ----
+local y  pc_AEB_aeb
+local X  ///
+    pc_News_Based_Policy_Uncert_Inde ///
+    pc_SI_Dem_part pc_SI_Ind_part pc_SI_Rep_part ///
+    pc_CCI_monthly_cci pc_UMCSENT_umc pc_EOM_Close_de ///
+    pc_GEPU_current_gepu pc_TPU_tpu pc_SBOI_nfibo ///
+    pc_UncertaintyIndex_nfibu pc_vix_vix
+
+* ensure y is not on RHS
+local X : list X - `y'
+
+* ---- Fourier seasonality (K=1; robust to gaps by using mdate) ----
+capture drop s1 c1
+gen double _w = 2*_pi/12
+gen double s1 = sin(_w*mdate)
+gen double c1 = cos(_w*mdate)
+drop _w
+local X `X' s1 c1
+
+* (Optional K=2) uncomment next two lines if needed:
+* gen double s2 = sin(2*(2*_pi/12)*mdate)
+* gen double c2 = cos(2*(2*_pi/12)*mdate)
+* local X `X' s2 c2
+
+* ---- Target lags (often boosts RF performance) ----
+foreach k in 1 2 3 {
+    capture drop pc_AEB_aeb_l`k'
+    gen pc_AEB_aeb_l`k' = L`k'.pc_AEB_aeb
+}
+local X `X' pc_AEB_aeb_l1 pc_AEB_aeb_l2 pc_AEB_aeb_l3
+
+* ---- Train/Test split (last 24 months = test) ----
+quietly summarize mdate
+local tmax = r(max)
+capture drop is_test
+gen byte is_test = (mdate > `tmax' - 23)
+label define split 0 "train" 1 "test"
+label values is_test split
+
+* ---- Train only where y is observed (rforest requirement) ----
+capture drop ok_train ok_test_eval
+gen byte ok_train     = (is_test==0 & !missing(pc_AEB_aeb))
+gen byte ok_test_eval = (is_test==1 & !missing(pc_AEB_aeb))
+
+* ---- Install/verify rforest ----
+cap which rforest
+if _rc ssc install rforest, replace
+set seed 12345
+
+* Choose numvars ~ sqrt(#features)
+local p : word count `X'
+local mtry = ceil(sqrt(`p'))
+
+* ---- Fit Random Forest (regression) ----
+rforest pc_AEB_aeb `X' if ok_train, ///
+    type(reg) iterations(800) numvars(`mtry') lsize(5) depth(0) seed(12345)
+
+di as txt    "OOB RMSE (train build): " %9.4f e(OOB_Error)
+
+* ---- Predict on TEST and print RF metrics ----
+capture drop yhat_rf
+predict yhat_rf if is_test==1
+di as result "TEST MAE (RF):  " %9.4f e(MAE)  "   TEST RMSE (RF): " %9.4f e(RMSE)
+
+* ---- TEST R^2 and MAPE ----
+preserve
+    keep if ok_test_eval
+    gen resid = pc_AEB_aeb - yhat_rf
+    quietly summarize pc_AEB_aeb
+    local ybar = r(mean)
+    gen sst = (pc_AEB_aeb - `ybar')^2
+    gen sse = resid^2
+    quietly summarize sse
+    local SSE = r(sum)
+    quietly summarize sst
+    local SST = r(sum)
+    di as result "TEST R^2 (RF): " %6.3f (1 - `SSE'/`SST')
+    gen ape = 100*abs(resid/pc_AEB_aeb) if pc_AEB_aeb!=0
+    quietly summarize ape
+    di as result "TEST MAPE (RF): " %6.2f r(mean) " %"
+restore
+
+* ---- Baseline comparisons (Naive-1M & Seasonal-12M) ----
+capture drop y_naive1 y_seas12
+gen y_naive1 = L1.pc_AEB_aeb
+gen y_seas12 = L12.pc_AEB_aeb
+
+preserve
+    keep if ok_test_eval
+    * Naive-1M RMSE
+    gen err1 = pc_AEB_aeb - y_naive1
+    gen se1  = err1^2
+    quietly summarize se1
+    di as txt "Naive-1M RMSE:     " %9.4f sqrt(r(mean))
+    * Seasonal-12M RMSE
+    gen err12 = pc_AEB_aeb - y_seas12
+    gen se12  = err12^2
+    quietly summarize se12
+    di as txt "Seasonal-12M RMSE: " %9.4f sqrt(r(mean))
+restore
+
+* ---- Save predictions (all rows) ----
+preserve
+    keep mdate pc_AEB_aeb yhat_rf is_test
+    compress
+    save "$PROC\rf_preds_pctchg_rforest.dta", replace
+    export delimited using "$TAB\T_rf_preds_pctchg_rforest.csv", replace
+restore
+di as result "✅ Saved: $PROC\rf_preds_pctchg_rforest.dta and $TAB\T_rf_preds_pctchg_rforest.csv"
+
+* ---- Variable importance -> CSV ----
+capture matrix list e(importance)
+if !_rc {
+    matrix VI = e(importance)
+    preserve
+        clear
+        svmat double VI, names(col)
+        gen variable = ""
+        local rn : rownames VI
+        local i = 1
+        foreach r of local rn {
+            replace variable = "`r'" in `i'
+            local ++i
+        }
+        order variable
+        compress
+        save "$PROC\rf_varimp_pctchg_rforest.dta", replace
+        export delimited using "$TAB\T_rf_varimp_pctchg_rforest.csv", replace
+    restore
+    di as result "✅ Saved: $PROC\rf_varimp_pctchg_rforest.dta and $TAB\T_rf_varimp_pctchg_rforest.csv"
+} 
+else di as txt "ℹ️ e(importance) not found; skipping var-importance export."
