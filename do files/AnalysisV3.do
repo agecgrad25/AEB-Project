@@ -60,9 +60,16 @@ if _rc {
     if !_rc gen double z_AEB = z_AEB_aeb
 }
 
+
+
 **************************************************************
-* 2) Pairwise correlations: z_AEB vs everyone else (no seasons)
+* 2) Correlations — include seasons + export full matrix
 **************************************************************
+* Build clean lists
+ds se_*, has(type numeric)
+local seasons `r(varlist)'
+
+* Non-season numerics (used for z_ counterparts in pairwise)
 local others `nums_noseason'
 local others : list others - mdate
 local others : list others - AEB
@@ -72,29 +79,89 @@ local others : list others - AEB_aeb
 local safe_others
 foreach v of local others {
     capture confirm variable z_`v'
-    if !_rc {
-        local safe_others `safe_others' `v'
+    if !_rc local safe_others `safe_others' `v'
+}
+
+* ------------ 2A) Pairwise: corr(z_AEB, z_* or se_*) ------------
+preserve
+    tempfile out
+    tempname ph
+    postfile `ph' str64 var double rho int N using "`out'", replace
+
+    * Non-season variables (use z_ versions)
+    foreach v of local safe_others {
+        quietly corr z_AEB z_`v'
+        post `ph' ("`v'") (r(rho)) (r(N))
     }
-}
 
-tempfile out
-tempname ph
-postfile `ph' str64 var double rho int N using "`out'", replace
-foreach v of local safe_others {
-    quietly corr z_AEB z_`v'
-    post `ph' ("`v'") (r(rho)) (r(N))
-}
-postclose `ph'
+    * Season dummies (use raw se_* with z_AEB)
+    if "`seasons'" != "" {
+        foreach s of local seasons {
+            quietly corr z_AEB `s'
+            post `ph' ("`s'") (r(rho)) (r(N))
+        }
+    }
 
-use "`out'", clear
-drop if missing(rho)
-gen double abs_rho = abs(rho)
-gsort -abs_rho
-order var rho N
-format rho %6.3f
-format N   %9.0f
-export delimited using "$TAB\T3_corr_AEB_pairwise`SUF'.csv", replace
-drop abs_rho
+    postclose `ph'
+
+    use "`out'", clear
+    drop if missing(rho)
+    gen double abs_rho = abs(rho)
+    gsort -abs_rho
+    order var rho N
+    format rho %6.3f
+    format N   %9.0f
+    export delimited using "$TAB\T3_corr_AEB_pairwise`SUF'.csv", replace
+restore
+
+* ------------ 2B) Full correlation matrix (incl. seasons) ------------
+* Build matrix varlist: AEB + (non-season numerics without AEB) + seasons
+local tmp `nums_noseason'
+local tmp : list tmp - AEB
+local tmp : list tmp - AEB_aeb
+local CMAT "AEB `tmp' `seasons'"
+
+quietly corr `CMAT'
+matrix C = r(C)
+
+* --- Make column names legal, <=32 chars, and UNIQUE to satisfy svmat
+local cols : colnames C
+local safe ""
+local used ""
+local i = 0
+foreach c of local cols {
+    local ++i
+    local base = strtoname("`c'")
+    if strlen("`base'")>28 local base = substr("`base'",1,28)
+    local nm "`base'"
+    local k = 1
+    while strpos(" `used' "," `nm' ") {
+        local suffix _`k'
+        local slen : length local suffix
+        local blen = 32 - `slen'
+        if `blen' < 1 local blen = 1
+        local nm = substr("`base'",1,`blen')
+        local nm "`nm'`suffix'"
+        local ++k
+    }
+    local used `used' `nm'
+    local safe `safe' `nm'
+}
+matrix colnames C = `safe'
+
+preserve
+    clear
+    svmat double C, names(col)
+    gen variable = ""
+    local rn : rownames C
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_corr_full`SUF'.csv", replace
+restore
 
 *****************************************************************
 * 3) (Optional) Rolling 24-month correlations (exclude seasons)
@@ -606,134 +673,3 @@ capture confirm local SUF
 if _rc local SUF ""
 export delimited using "$TAB\T_reg_top5`SUF'.csv", replace
 
-
-*******************************************************
-* 7) VAR & Granger causality — regular aebcorrsv3
-*******************************************************
-local USE_DIFF 0
-capture confirm local SUF
-if _rc local SUF "_v3"
-
-* A) Load data (levels/diff)
-if `USE_DIFF'==0 {
-    use "$PROC\aebcorrsv3.dta", clear
-}
-else {
-    use "$PROC\aebcorrsv3_diff.dta", clear
-}
-
-format mdate %tm
-tsset mdate, monthly
-
-* B) Build variable set
-local AEBvar ""
-capture confirm variable AEB
-if !_rc local AEBvar AEB
-else {
-    capture confirm variable AEB_aeb
-    if !_rc local AEBvar AEB_aeb
-}
-if "`AEBvar'"=="" {
-    di as err "AEB (or AEB_aeb) not found."
-    exit 111
-}
-
-local base_candidates ///
-    News_Based_Policy_Uncert_Index ///
-    CCI_monthly_cci ///
-    UMCSENT_umc ///
-    vix_vix ///
-    corn_vol_month ///
-    sb_vol_month
-
-local VARLIST ""
-if `USE_DIFF'==0 {
-    foreach c of local base_candidates {
-        capture confirm variable `c'
-        if !_rc local VARLIST `VARLIST' `c'
-    }
-    local DV "`AEBvar'"
-}
-else {
-    local DV d_`AEBvar'
-    capture confirm variable `DV'
-    if _rc {
-        di as err "Dependent variable `DV' not found in aebcorrsv3_diff.dta."
-        exit 111
-    }
-    foreach c of local base_candidates {
-        capture confirm variable d_`c'
-        if !_rc local VARLIST `VARLIST' d_`c'
-    }
-}
-
-local ENDOG "`DV' `VARLIST'"
-
-* Guard: if any season dummies slipped in, drop them
-capture unab sez : se_* d_se_*
-if !_rc {
-    local ENDOG : list ENDOG - sez
-}
-
-local k : word count `ENDOG'
-if `k' < 2 {
-    di as err "Not enough variables for VAR (need >=2). Endog: `ENDOG'"
-    exit 111
-}
-
-* C) Select lags via varsoc (max 6)
-local LMAX = 6
-capture noisily varsoc `ENDOG', maxlags(`LMAX')
-local PSEL = 2
-capture mata: st_local("PSEL", strofreal(panelsetup(st_matrix("r(stats)"))))
-
-capture matrix S = r(stats)
-if !_rc {
-    local n = rowsof(S)
-    local best = .
-    local argbest = .
-    forvalues p = 1/`n' {
-        scalar sb = S[`p',4]
-        if missing(`best') | sb < `best' {
-            scalar best = sb
-            local argbest = `p'
-        }
-    }
-    if "`argbest'"!="" local PSEL = `argbest'
-}
-
-* D) Estimate VAR and diagnostics
-quietly var `ENDOG', lags(1/`PSEL') dfk small
-varstable, graph
-graph export "$FIG\G_VAR_stability`SUF'.png", replace width(1600)
-varlmar, mlag(`PSEL')
-
-* E) Granger causality
-vargranger
-local DRIVERS : list ENDOG - DV
-foreach x of local DRIVERS {
-    test ([`DV']L(1/`PSEL').`x' = 0)
-}
-
-* F) Optional: IRFs (levels only advisable if stationary/cointegrated)
-tempname has_epu has_vix has_corn has_sb
-scalar `has_epu'  = 0
-scalar `has_vix'  = 0
-scalar `has_corn' = 0
-scalar `has_sb'   = 0
-
-if `USE_DIFF'==0 {
-    capture confirm variable News_Based_Policy_Uncert_Index
-    if !_rc scalar `has_epu' = 1
-    capture confirm variable vix_vix
-    if !_rc scalar `has_vix' = 1
-    capture confirm variable corn_vol_month
-    if !_rc scalar `has_corn' = 1
-    capture confirm variable sb_vol_month
-    if !_rc scalar `has_sb' = 1
-
-    irf set "$PROC\IRF_aeb`SUF'", replace
-    irf create var_lvl`SUF', step(24) replace
-
-    * (optional IRF graph/export blocks follow...)
-}
