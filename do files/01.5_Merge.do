@@ -120,16 +120,23 @@ use "$PROC\firstcorrsv2_post2014.dta", clear
 format mdate %tm
 
 merge 1:1 mdate using "$PROC\cornvol.dta", ///
-    keep(master match) nogen keepusing(vol_cc_month vol_cc_ann)
-rename vol_cc_month corn_vol_month
-rename vol_cc_ann   corn_vol_ann
+    keep(master match) nogen ///
+    keepusing(Close vol_cc_month vol_cc_ann)
+rename Close           corn_close
+rename vol_cc_month    corn_vol_month
+rename vol_cc_ann      corn_vol_ann
+label var corn_close           "Corn month-end closing price"
 
 merge 1:1 mdate using "$PROC\sbvol.dta", ///
-    keep(master match) nogen keepusing(vol_cc_month vol_cc_ann)
-rename vol_cc_month sb_vol_month
-rename vol_cc_ann   sb_vol_ann
+    keep(master match) nogen ///
+    keepusing( Close vol_cc_month vol_cc_ann)
+rename Close           sb_close
+rename vol_cc_month    sb_vol_month
+rename vol_cc_ann      sb_vol_ann
+label var sb_close           "Soybean month-end closing price"
 
-order corn_vol_month corn_vol_ann sb_vol_month sb_vol_ann, after(mdate)
+order corn_close corn_vol_month corn_vol_ann ///
+       sb_close sb_vol_month sb_vol_ann, after(mdate)
 compress
 save "$PROC\aebcorrsv3.dta", replace
 di as result "✅ Final: $PROC\aebcorrsv3.dta (post-2014 + corn/soy vols)."

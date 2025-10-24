@@ -890,7 +890,10 @@ gen double vol_cc_ann   = sd_r*sqrt(252)
 
 * collapse to one row per month
 bysort mdate (ExchangeDate): keep if _n==_N
-keep mdate vol_cc_month vol_cc_ann
+rename ExchangeDate month_last_date
+label var Close "Month-end closing price"
+order mdate Close, first
+keep mdate Close vol_cc_month vol_cc_ann
 
 save "$PROC\cornvol.dta", replace
 
@@ -931,6 +934,9 @@ gen double vol_cc_month = sd_r*sqrt(N)
 gen double vol_cc_ann   = sd_r*sqrt(252)
 
 bysort mdate (ExchangeDate): keep if _n==_N
-keep mdate vol_cc_month vol_cc_ann
+rename ExchangeDate month_last_date
+label var Close "Month-end closing price"
+order mdate month_last_date Close, first
+keep mdate Close vol_cc_month vol_cc_ann
 
 save "$PROC\sbvol.dta", replace
