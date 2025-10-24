@@ -1,7 +1,6 @@
 *******************************************************
 * 03_analysis_simple_v19.do — simple (Stata 19)
-* Input: $PROC\aebcorrsv3.dta  (post-2014, +corn/soy, +Seasons)
-*******************************************************
+* Input: $PROC\aebcorrsv3.dta  (post-2014, +corn/soy prices & vols, +Seasons)*******************************************************
 
 version 19.0
 clear all
@@ -691,8 +690,10 @@ foreach v of local cn {
     local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
     local short : subinstr local short "corn_vol_month"                "corn_mo",   all
     local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
+	    local short : subinstr local short "corn_close"                    "corn_px",   all
     local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
     local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
+	  local short : subinstr local short "sb_close"                      "soy_px",    all
     local short : subinstr local short "vix_vix"                       "VIX",       all
     local short : subinstr local short "_cons"                         "Intercept", all
     local short : subinstr local short "se_spring"                     "Spring",    all
@@ -723,7 +724,11 @@ export delimited using "$TAB\kitchen_sink.csv", replace
 *     (no seasons, N>=90, original order, star p<.05)
 *******************************************************
 
-* Assumes aebcorrsv3_diff.dta is already loaded & tsset
+* Load differenced data (consistent with later horse-race steps)
+use "$PROC\aebcorrsv3_diff.dta", clear
+format mdate %tm
+tsset mdate, monthly
+
 * DV (prefer d_AEB_aeb; fallback d_AEB)
 local y ""
 capture confirm variable d_AEB_aeb
@@ -781,8 +786,10 @@ forvalues j = 1/`K' {
     local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
     local short : subinstr local short "corn_vol_month"                "corn_mo",   all
     local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
+	local short : subinstr local short "corn_close"                    "corn_px",   all
     local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
     local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
+	local short : subinstr local short "sb_close"                      "soy_px",    all
     local short : subinstr local short "vix_vix"                       "VIX",       all
 
     local star ""
@@ -901,8 +908,10 @@ forvalues j = 1/`K' {
     local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
     local short : subinstr local short "corn_vol_month"                "corn_mo",   all
     local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
+	local short : subinstr local short "corn_close"                    "corn_px",   all
     local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
     local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
+	local short : subinstr local short "sb_close"                      "soy_px",    all
     local short : subinstr local short "vix_vix"                       "VIX",       all
 
     local star ""
@@ -1057,8 +1066,10 @@ foreach v of local cn {
     local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
     local short : subinstr local short "corn_vol_month"                "corn_mo",   all
     local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
+	local short : subinstr local short "corn_close"                    "corn_px",   all
     local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
     local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
+	local short : subinstr local short "sb_close"                      "soy_px",    all
     local short : subinstr local short "vix_vix"                       "VIX",       all
     local short : subinstr local short "_cons"                         "Intercept", all
 
@@ -1074,7 +1085,7 @@ format p %6.4f
 format r2 adjr2 %6.4f
 format N %9.0f
 format rmse %9.3g
-export delimited using "$TAB\kitchen_sink.csv", replace
+export delimited using "$TAB\kitchen_sink_noseasons.csv", replace
 
 
 *******************************************************
@@ -1176,8 +1187,10 @@ if "`SE_nobase'" != "" {
     local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
     local short : subinstr local short "corn_vol_month"                "corn_mo",   all
     local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
+	    local short : subinstr local short "corn_close"                    "corn_px",   all
     local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
     local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
+	    local short : subinstr local short "sb_close"                      "soy_px",    all
     local short : subinstr local short "vix_vix"                       "VIX",       all
 
     local star ""
@@ -1294,8 +1307,10 @@ forvalues j = 1/`K' {
     local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
     local short : subinstr local short "corn_vol_month"                "corn_mo",   all
     local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
+	    local short : subinstr local short "corn_close"                    "corn_px",   all
     local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
     local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
+	    local short : subinstr local short "sb_close"                      "soy_px",    all
     local short : subinstr local short "vix_vix"                       "VIX",       all
 
     local star ""
