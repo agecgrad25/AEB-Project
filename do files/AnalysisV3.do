@@ -690,7 +690,7 @@ foreach v of local cn {
     local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
     local short : subinstr local short "corn_vol_month"                "corn_mo",   all
     local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
-	    local short : subinstr local short "corn_close"                    "corn_px",   all
+	local short : subinstr local short "corn_close"               "corn_px",   all
     local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
     local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
 	  local short : subinstr local short "sb_close"                      "soy_px",    all
@@ -706,7 +706,7 @@ foreach v of local cn {
 }
 postclose `PF'
 
-use "`KS'", clear
+use "`KS'", clear␊
 order var short b se t p star r2 adjr2 N rmse p_seasons
 format b se %9.3g
 format t %8.2f
@@ -802,6 +802,7 @@ postclose `PF'
 use "`HR'", clear
 order var short b se t p star r2 N const_b const_se 
 format b se %9.3g
+format const_b const_se %9.3g
 format t %8.2f
 format p %6.4f
 format r2 %6.4f
@@ -957,6 +958,7 @@ postclose `PFs'
 use "`HRs'", clear
 order var short b se t p star r2 N const_b const_se
 format b se %9.3g
+format const_b const_se %9.3g
 format t %8.2f
 format p %6.4f
 format r2 %6.4f
@@ -986,13 +988,14 @@ if "`y'"=="" {
     exit 111
 }
 
-* ---- Candidate predictors: all d_* minus DV diffs and d_mdate
+* ---- Candidate predictors: build from d_* while explicitly skipping DV aliases + d_mdate
 ds d_*, has(type numeric)
-local X `r(varlist)'
-local X : list X - `y'
-local X : list X - d_AEB_aeb
-local X : list X - d_AEB
-local X : list X - d_mdate
+local rawX `r(varlist)'
+local X ""
+foreach v of local rawX {
+    if inlist("`v'", "`y'", "d_AEB_aeb", "d_AEB", "d_mdate") continue
+    local X `X' `v'
+}
 local p0 : word count `X'
 if `p0'==0 {
     di as err "Kitchen sink (no seasons): no candidate d_* predictors."
@@ -1008,7 +1011,6 @@ foreach v of local X {
 }
 count if `T'
 local Ncommon = r(N)
-
 * Drop predictors that are constant on the common sample
 local Xclean
 foreach v of local X {
@@ -1016,6 +1018,19 @@ foreach v of local X {
     if r(Var)>0 & r(N)>0 local Xclean `Xclean' `v'
 }
 local X "`Xclean'"
+
+* Double-check: ensure the dependent variable (or its aliases) are not in X
+local DV_present : list X & `y'
+if "`DV_present'" != "" {
+    di as err "Kitchen sink (no seasons): dropping DV `y' from predictors to avoid R2=1."
+    local X : list X - `y'
+}
+* Also guard against alternate DV alias accidentally persisting
+local DV_aliases "d_AEB_aeb d_AEB"
+local drop_alias : list X & DV_aliases
+if "`drop_alias'" != "" {
+    local X : list X - `drop_alias'
+}
 
 * ---- Fit kitchen-sink (NO seasons), robust SEs
 quietly regress `y' `X', vce(robust)
@@ -1126,11 +1141,12 @@ if "`y'"=="" {
 
 * ---- Build X list in dataset order: all d_* minus DV and d_mdate
 ds d_*, has(type numeric)
-local X `r(varlist)'
-local X : list X - `y'
-local X : list X - d_AEB_aeb
-local X : list X - d_AEB
-local X : list X - d_mdate
+local rawX `r(varlist)'
+local X ""
+foreach v of local rawX {
+    if inlist("`v'", "`y'", "d_AEB_aeb", "d_AEB", "d_mdate") continue
+    local X `X' `v'
+}
 local K : word count `X'
 if `K'==0 {
     di as err "Horse-race (seasons): no candidate d_* predictors found."
@@ -1152,25 +1168,31 @@ if `nSE'==`nSEnb' & `nSE'>0 {
 * ---- Collect results
 tempfile HRs
 tempname PFs
-postfile `PFs' str64 var str32 short double b se t p r2 N str1 star double p_seasons using "`HRs'", replace
+postfile `PFs' str64 var str32 short double b se t p r2 N str1 star ///
+    double const_b double const_se double p_seasons using "`HRs'", replace
 
 forvalues j = 1/`K' {
     local v : word `j' of `X'
 
     quietly regress `y' `v' `SE_nobase', vce(robust)
     if _rc | missing(e(N)) continue
-    if (e(N) < 90) continue
-	scalar pS = .
-if "`SE_nobase'" != "" {
-    quietly testparm `SE_nobase'
-    scalar pS = r(p)
-}
-    scalar b  = _b[`v']
-    scalar se = _se[`v']
-    scalar t  = b/se
-    scalar p  = 2*ttail(e(df_r), abs(t))
-    scalar r2 = e(r2)
-    scalar NN = e(N)
+     if (e(N) < 90) continue
+
+    scalar pS = .
+    if "`SE_nobase'" != "" {
+        quietly testparm `SE_nobase'
+        scalar pS = r(p)
+    }
+    scalar b   = _b[`v']
+    scalar se  = _se[`v']
+    scalar t   = b/se
+    scalar p   = 2*ttail(e(df_r), abs(t))
+    scalar r2  = e(r2)
+    scalar NN  = e(N)
+    scalar b0  = .
+    capture scalar b0 = _b[_cons]
+    scalar se0 = .
+    capture scalar se0 = _se[_cons]
 
     * Short names
     local short "`v'"
@@ -1196,13 +1218,14 @@ if "`SE_nobase'" != "" {
     local star ""
     if (p < .05) local star "*"
 
-	post `PFs' ("`v'") ("`short'") (b) (se) (t) (p) (r2) (NN) ("`star'") (pS)
+	  post `PFs' ("`v'") ("`short'") (b) (se) (t) (p) (r2) (NN) ("`star'") (b0) (se0) (pS)
 }
 postclose `PFs'
 
 use "`HRs'", clear
-order var short b se t p star p_seasons r2 N
+order var short b se t p star r2 N const_b const_se p_seasons
 format b se %9.3g
+format const_b const_se %9.3g
 format t %8.2f
 format p %6.4f
 format r2 %6.4f
@@ -1215,7 +1238,7 @@ export delimited using "$TAB\horse_race_ctrlseasons.csv", replace
 *     + append seasons as additional variables (rows)
 *     (N>=90, original order, star p<.05, short names)
 *******************************************************
-
+clear all
 * Load diffs and make sure seasons exist
 use "$PROC\aebcorrsv3_diff.dta", clear
 format mdate %tm
@@ -1248,11 +1271,12 @@ if "`y'"=="" {
 
 * Candidate X in dataset order: all d_* minus DV and d_mdate
 ds d_*, has(type numeric)
-local X `r(varlist)'
-local X : list X - `y'
-local X : list X - d_AEB_aeb
-local X : list X - d_AEB
-local X : list X - d_mdate
+local rawX `r(varlist)'
+local X ""
+foreach v of local rawX {
+    if inlist("`v'", "`y'", "d_AEB_aeb", "d_AEB", "d_mdate") continue
+    local X `X' `v'
+}
 local K : word count `X'
 if `K'==0 {
     di as err "Horse-race (seasons): no candidate d_* predictors."
@@ -1276,7 +1300,8 @@ if `nSE'==`nSEnb' & `nSE'>0 {
 * Results collector
 tempfile HRs
 tempname PFs
-postfile `PFs' str64 var str32 short double b se t p r2 N str1 star using "`HRs'", replace
+postfile `PFs' str64 var str32 short double b se t p r2 N str1 star ///
+    double const_b double const_se using "`HRs'", replace
 
 * ---- (A) One-at-a-time predictors WITH season controls ----
 forvalues j = 1/`K' {
@@ -1285,12 +1310,16 @@ forvalues j = 1/`K' {
     if _rc | missing(e(N)) continue
     if (e(N) < 90) continue
 
-    scalar b  = _b[`v']
-    scalar se = _se[`v']
-    scalar t  = b/se
-    scalar p  = 2*ttail(e(df_r), abs(t))
-    scalar r2 = e(r2)
-    scalar NN = e(N)
+    scalar b   = _b[`v']
+    scalar se  = _se[`v']
+    scalar t   = b/se
+    scalar p   = 2*ttail(e(df_r), abs(t))
+    scalar r2  = e(r2)
+    scalar NN  = e(N)
+    scalar b0  = .
+    capture scalar b0 = _b[_cons]
+    scalar se0 = .
+    capture scalar se0 = _se[_cons]
 
     * Short names
     local short "`v'"
@@ -1307,16 +1336,16 @@ forvalues j = 1/`K' {
     local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
     local short : subinstr local short "corn_vol_month"                "corn_mo",   all
     local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
-	    local short : subinstr local short "corn_close"                    "corn_px",   all
+    local short : subinstr local short "corn_close"                    "corn_px",   all
     local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
     local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
-	    local short : subinstr local short "sb_close"                      "soy_px",    all
+    local short : subinstr local short "sb_close"                      "soy_px",    all
     local short : subinstr local short "vix_vix"                       "VIX",       all
 
     local star ""
     if (p < .05) local star "*"
 
-    post `PFs' ("`v'") ("`short'") (b) (se) (t) (p) (r2) (NN) ("`star'")
+    post `PFs' ("`v'") ("`short'") (b) (se) (t) (p) (r2) (NN) ("`star'") (b0) (se0)
 }
 
 * ---- (B) Append the season dummies as additional variables (rows) ----
@@ -1325,6 +1354,10 @@ if "`SE_nobase'" != "" {
     if !_rc & e(N)>=90 {
         scalar r2s = e(r2)
         scalar NNs = e(N)
+        scalar b0s = .
+        capture scalar b0s = _b[_cons]
+        scalar se0s = .
+        capture scalar se0s = _se[_cons]
         foreach s of local SE_nobase {
             local sh "`s'"
             local sh : subinstr local sh "se_spring" "Spring", all
@@ -1339,7 +1372,7 @@ if "`SE_nobase'" != "" {
             scalar ps = 2*ttail(e(df_r), abs(ts))
             local star ""
             if (ps < .05) local star "*"
-            post `PFs' ("`s'") ("`sh'") (bs) (ses) (ts) (ps) (r2s) (NNs) ("`star'")
+            post `PFs' ("`s'") ("`sh'") (bs) (ses) (ts) (ps) (r2s) (NNs) ("`star'") (b0s) (se0s)
         }
     }
 }
@@ -1347,12 +1380,12 @@ if "`SE_nobase'" != "" {
 postclose `PFs'
 
 use "`HRs'", clear
-order var short b se t p star r2 N
+order var short b se t p star r2 N const_b const_se
 format b se %9.3g
+format const_b const_se %9.3g
 format t %8.2f
 format p %6.4f
 format r2 %6.4f
 format N  %9.0f
 
 export delimited using "$TAB\horse_race_snlctrl+seasons.csv", replace
-
