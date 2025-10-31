@@ -151,9 +151,99 @@ if !_rc {
         if !_rc esttab matrix(Cmn) using "$TABLES/T_FA_communalities.csv", replace b(3)
     }
     else di as error "esttab not installed; tables not exported."
+	
+* ---------- Orthogonal rotation (VARIMAX) on same 2-factor model ----------
+* Refit clean (unrotated) 2-factor model on the same keepitems
+factor `keepitems', pcf factors(2) corr
+estat kmo
+
+* Varimax rotation (orthogonal)
+rotate, varimax
+
+* PATTERN loadings after varimax (for orthogonal rotations, pattern = structure)
+matrix Lpat_v = e(L)
+mat rownames Lpat_v = `keepitems'
+
+* Factor names
+local kv = colsof(Lpat_v)
+local fnames_v
+forvalues j=1/`kv' {
+    local fnames_v `fnames_v' F`j'
+}
+mat colnames Lpat_v = `fnames_v'
+
+* Phi (factor correlations) is identity under orthogonal rotation
+matrix Phi_v = I(`kv')
+mat rownames Phi_v = `fnames_v'
+mat colnames Phi_v = `fnames_v'
+
+* STRUCTURE loadings (= correlations); equals Lpat_v for orthogonal rotations
+matrix Lstr_v = Lpat_v
+mat rownames Lstr_v = `keepitems'
+mat colnames Lstr_v = `fnames_v'
+
+* Communalities and uniquenesses
+local pv = rowsof(Lstr_v)
+local kv2 = colsof(Lstr_v)
+matrix Cmn_v = J(`pv',1,.)
+forvalues i=1/`pv' {
+    scalar rsq_v = 0
+    forvalues j=1/`kv2' {
+        scalar rsq_v = rsq_v + (Lstr_v[`i',`j']^2)
+    }
+    matrix Cmn_v[`i',1] = rsq_v
+}
+mat rownames Cmn_v = `keepitems'
+mat colnames Cmn_v = Communality
+
+matrix Unq_v = J(rowsof(Cmn_v), 1, 1)
+matrix Unq_v = Unq_v - Cmn_v
+mat rownames Unq_v = `keepitems'
+mat colnames Unq_v = Uniqueness
+
+* ---------- Export (VARIMAX) ----------
+cap which esttab
+if !_rc {
+    esttab matrix(Lpat_v) using "$TABLES/T_FA_loadings_pattern_varimax.csv",   replace nonumber nomtitles b(3)
+    esttab matrix(Lstr_v) using "$TABLES/T_FA_loadings_structure_varimax.csv", replace nonumber nomtitles b(3)
+    esttab matrix(Phi_v)  using "$TABLES/T_FA_factor_correlations_varimax.csv", replace nonumber nomtitles b(3)
+    esttab matrix(Cmn_v)  using "$TABLES/T_FA_communalities_varimax.csv",      replace nonumber nomtitles b(3)
+    esttab matrix(Unq_v)  using "$TABLES/T_FA_uniqueness_varimax.csv",         replace nonumber nomtitles b(3)
+}
+
+* ---------- Tidy item→factor assignments (VARIMAX, 2-factor) ----------
+clear
+input str32 item
+"Q1"
+"Q2"
+"Q3"
+"Q4"
+"Q5"
+end
+
+tempname Mv
+matrix `Mv' = Lstr_v
+svmat double `Mv', names(col)   // creates F1 F2 for varimax
+
+gen double absF1 = abs(F1)
+gen double absF2 = abs(F2)
+gen str8  primary_factor  = cond(absF1 >= absF2, "F1", "F2")
+gen double primary_loading = cond(absF1 >= absF2, F1,  F2)
+
+local thresh = 0.30
+local thresh_tag : display %02.0f 100*`thresh'
+gen byte loads_ge_`thresh_tag' = (abs(primary_loading) >= `thresh')
+
+gen byte cross_loading = (abs(absF1 - absF2) < 0.15)
+
+order item F1 F2 primary_factor primary_loading loads_ge_`thresh_tag' cross_loading
+format F1 F2 primary_loading %6.3f
+
+export delimited using "$TABLES/T_FA_item_factor_assignments_varimax.csv", replace
+
 
    * ----- Tidy table (2-factor case) -----
-preserve
+
     clear
     input str32 item
     "Q1"
