@@ -186,7 +186,8 @@ preserve
     }
 
     * ---- Rolling correlations
-    foreach v of local safe_others { tempvar prod mx my mxy sx sy
+    foreach v of local safe_others {
+        tempvar prod mx my mxy sx sy
         gen double `prod' = z_AEB_aeb * z_`v'
         rangestat (mean) `mx'=z_AEB_aeb `my'=z_`v' `mxy'=`prod' ///
                   (sd)   `sx'=z_AEB_aeb `sy'=z_`v', interval(mdate -23 0)
@@ -201,7 +202,7 @@ preserve
         local k = 1
         while !_rc {
             local rname = "r_AEB_aeb_`base'_`k'"
-            local ++k␊
+            local ++k
             capture confirm variable `rname'
         }
 
@@ -219,7 +220,7 @@ restore
 **************************************************************
 * 4) (Optional) Quick chart for one rolling series
 **************************************************************
-use "$PROC\monthly_rollingcorrs_simple`SUF'.dta", clear␊
+use "$PROC\monthly_rollingcorrs_simple`SUF'.dta", clear
 local target r_AEB_aeb_News_Based_Policy_Uncert_Index
 capture confirm variable `target'
 if _rc {
@@ -701,7 +702,7 @@ foreach v of local cn {
 }
 postclose `PF'
 
-use "`KS'", clear␊
+use "`KS'", clear
 order var short b se t p star r2 adjr2 N rmse p_seasons
 format b se %9.3g
 format t %8.2f
