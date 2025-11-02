@@ -26,11 +26,6 @@ if _rc {
     exit 111
 }
 
-* Remove the raw AEB series from the working copy so it cannot leak into
-* any pre-OLS analytics (PCA/FA, correlations, etc.)
-drop AEB_aeb
-di as txt "Removed AEB_aeb from in-memory dataset prior to section 6 analyses."
-
 * Pre-OLS safeguards: drop any lingering standardized AEB so it cannot be reused
 capture drop z_AEB_aeb
 
@@ -43,7 +38,6 @@ local seasons `r(varlist)'
 
 * Keep a "no-season" numeric set for transforms/analyses
 local nums_noseason : list allnum - seasons
-local nums_noseason : list nums_noseason - AEB_aeb
 
 *******************************************************
 * 1) Z-score all numeric vars (exclude mdate, seasons)
@@ -147,9 +141,7 @@ preserve
     local allnum : list allnum - mdate
     ds se_*, has(type numeric)
     local seasons `r(varlist)'
-    capture drop AEB_aeb
     local nums_noseason : list allnum - seasons
-    local nums_noseason : list nums_noseason - AEB_aeb
 
     * Rebuild z_ for these only (all numeric sans seasons)
     local zbase `nums_noseason'
@@ -178,19 +170,11 @@ capture unab zvars : z_*
 if !_rc {
     local Xraw : list Xraw - zvars
 }
-if strpos(" `Xraw' ", " AEB_aeb ") {
-    di as txt "Stripping residual AEB_aeb from raw PCA/FA inputs to enforce pre-OLS ban."
-    local Xraw : list Xraw - AEB_aeb
-}
 
 * Build Z = all z_* constructed above
 capture unab Z : z_*
 if _rc local Z ""
 local Z : list Z - z_AEB_aeb
-if strpos(" `Z' ", " z_AEB_aeb ") {
-    di as txt "Stripping residual z_AEB_aeb from standardized PCA/FA inputs to enforce pre-OLS ban."
-    local Z : list Z - z_AEB_aeb
-}
 
 local p_raw : word count `Xraw'
 local p_z   : word count `Z'
