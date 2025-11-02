@@ -19,19 +19,20 @@ tsset mdate, monthly
 * Suffix for all outputs in this run
 local SUF "_v3"
 
-* Ensure AEB exists (canonical alias of AEB_aeb for convenience)
-capture confirm variable AEB
+* Ensure AEB_aeb exists (only AEB series in this dataset)
+capture confirm variable AEB_aeb
 if _rc {
-    capture confirm variable AEB_aeb
-    if !_rc {
-        gen AEB = AEB_aeb
-    }
-}
-capture confirm variable AEB
-if _rc {
-    di as err "AEB not found in the dataset."
+    di as err "AEB_aeb not found in the dataset."
     exit 111
 }
+
+* Remove the raw AEB series from the working copy so it cannot leak into
+* any pre-OLS analytics (PCA/FA, correlations, etc.)
+drop AEB_aeb
+di as txt "Removed AEB_aeb from in-memory dataset prior to section 6 analyses."
+
+* Pre-OLS safeguards: drop any lingering standardized AEB so it cannot be reused
+capture drop z_AEB_aeb
 
 * Identify numeric vars; exclude mdate and SEASON dummies (no Fourier terms exist)
 ds, has(type numeric)
@@ -42,21 +43,16 @@ local seasons `r(varlist)'
 
 * Keep a "no-season" numeric set for transforms/analyses
 local nums_noseason : list allnum - seasons
+local nums_noseason : list nums_noseason - AEB_aeb
 
 *******************************************************
-* 1) Z-score all numeric vars (exclude mdate, seasons, AEB alias)
+* 1) Z-score all numeric vars (exclude mdate, seasons)
 *******************************************************
 local zbase `nums_noseason'
-local zbase : list zbase - AEB
 foreach v of local zbase {
+    if "`v'" == "AEB_aeb" continue
     capture drop z_`v'
     quietly egen z_`v' = std(`v')
-}
-* Create z_AEB as alias of z_AEB_aeb if needed
-capture confirm variable z_AEB
-if _rc {
-    capture confirm variable z_AEB_aeb
-    if !_rc gen double z_AEB = z_AEB_aeb
 }
 
 
@@ -71,7 +67,6 @@ local seasons `r(varlist)'
 * Non-season numerics (used for z_ counterparts in pairwise)
 local others `nums_noseason'
 local others : list others - mdate
-local others : list others - AEB
 local others : list others - AEB_aeb
 
 * Keep only vars that actually have z_ counterparts
@@ -81,47 +76,21 @@ foreach v of local others {
     if !_rc local safe_others `safe_others' `v'
 }
 
-* ------------ 2A) Pairwise: corr(z_AEB, z_* or se_*) ------------
-preserve
-    tempfile out
-    tempname ph
-    postfile `ph' str64 var double rho int N using "`out'", replace
-
-    * Non-season variables (use z_ versions)
-    foreach v of local safe_others {
-        quietly corr z_AEB z_`v'
-        post `ph' ("`v'") (r(rho)) (r(N))
-    }
-
-    * Season dummies (use raw se_* with z_AEB)
-    if "`seasons'" != "" {
-        foreach s of local seasons {
-            quietly corr z_AEB `s'
-            post `ph' ("`s'") (r(rho)) (r(N))
-        }
-    }
-
-    postclose `ph'
-
-    use "`out'", clear
-    drop if missing(rho)
-    gen double abs_rho = abs(rho)
-    gsort -abs_rho
-    order var rho N
-    format rho %6.3f
-    format N   %9.0f
-    export delimited using "$TAB\T3_corr_AEB_pairwise`SUF'.csv", replace
-restore
+* ------------ 2A) Pairwise correlations ------------
+di as txt "Skipping pre-OLS pairwise correlations anchored on AEB_aeb."
 
 * ------------ 2B) Full correlation matrix (incl. seasons) ------------
-* Build matrix varlist: AEB + (non-season numerics without AEB) + seasons
+* Build matrix varlist without AEB_aeb (per pre-OLS exclusion)
 local tmp `nums_noseason'
-local tmp : list tmp - AEB
 local tmp : list tmp - AEB_aeb
-local CMAT "AEB `tmp' `seasons'"
+local CMAT "`tmp' `seasons'"
 
-quietly corr `CMAT'
-matrix C = r(C)
+if trim("`CMAT'") == "" {
+    di as txt "No variables available for correlation matrix once AEB_aeb is excluded."
+}
+else {
+    quietly corr `CMAT'
+    matrix C = r(C)
 
 * --- Make column names legal, <=32 chars, and UNIQUE to satisfy svmat
 local cols : colnames C
@@ -161,6 +130,7 @@ preserve
     order variable
     export delimited using "$TAB\T_corr_full`SUF'.csv", replace
 restore
+}
 
 *****************************************************************
 * 3) (Optional) Rolling 24-month correlations (exclude seasons)
@@ -177,107 +147,50 @@ preserve
     local allnum : list allnum - mdate
     ds se_*, has(type numeric)
     local seasons `r(varlist)'
+    capture drop AEB_aeb
     local nums_noseason : list allnum - seasons
+    local nums_noseason : list nums_noseason - AEB_aeb
 
-    * Rebuild z_ for these only (skip AEB alias to avoid duplicates)
+    * Rebuild z_ for these only (all numeric sans seasons)
     local zbase `nums_noseason'
-    local zbase : list zbase - AEB
     foreach v of local zbase {
         capture drop z_`v'
         quietly egen z_`v' = std(`v')
     }
-    capture confirm variable z_AEB
-    if _rc {
-        capture confirm variable z_AEB_aeb
-        if !_rc gen double z_AEB = z_AEB_aeb
-    }
-
-    * Rolling targets: no mdate/AEB; must have z_ partner
-    local others `nums_noseason'
-    local others : list others - mdate
-    local others : list others - AEB
-    local others : list others - AEB_aeb
-
-    local safe_others
-    foreach v of local others {
-        capture confirm variable z_`v'
-        if !_rc {
-            local safe_others `safe_others' `v'
-        }
-    }
-
-    * ---- Rolling correlations
-    foreach v of local safe_others {
-        tempvar prod mx my mxy sx sy
-        gen double `prod' = z_AEB * z_`v'
-        rangestat (mean) `mx'=z_AEB `my'=z_`v' `mxy'=`prod' ///
-                  (sd)   `sx'=z_AEB `sy'=z_`v', interval(mdate -23 0)
-
-        local base = strtoname("`v'")
-        local maxbase = 32 - `=strlen("r_AEB_")'
-        if strlen("`base'") > `maxbase' {
-            local base = substr("`base'", 1, `maxbase')
-        }
-        local rname = "r_AEB_`base'"
-        capture confirm variable `rname'
-        local k = 1
-        while !_rc {
-            local rname = "r_AEB_`base'_`k'"
-            local ++k
-            capture confirm variable `rname'
-        }
-
-        capture drop `rname'
-        gen double `rname' = (`mxy' - `mx'*`my') / (`sx'*`sy')
-        replace    `rname' = . if (`sx'==0 | `sy'==0)
-        drop `prod' `mx' `my' `mxy' `sx' `sy'
-    }
-
-    order mdate, first
-    compress
-    save "$PROC\monthly_rollingcorrs_simple`SUF'.dta", replace
+    di as txt "Skipping pre-OLS rolling correlations anchored on AEB_aeb."
 restore
 
 **************************************************************
 * 4) (Optional) Quick chart for one rolling series
 **************************************************************
-use "$PROC\monthly_rollingcorrs_simple`SUF'.dta", clear
-local target r_AEB_News_Based_Policy_Uncert_Index
-capture confirm variable `target'
-if _rc {
-    capture unab _cands : r_AEB_*
-    if !_rc {
-        local target : word 1 of `_cands'
-    }
-}
-capture confirm variable `target'
-if !_rc {
-    twoway tsline `target', ///
-        title("Rolling 24m corr: AEB vs selected") ytitle("corr") xtitle("")
-    graph export "$FIG\F3_roll_AEB_selected`SUF'.png", replace width(1600)
-}
-capture unab rvars : r_*
-if !_rc {
-    drop `rvars'
-}
+di as txt "Skipping rolling-correlation chart because AEB_aeb is excluded pre-OLS."
 
 **************************************************************
 * 5) PCA + FA — auto-build varlists (include corn/sb vols)
 **************************************************************
-* Build RAW = all numeric except mdate, seasons, z_* and the AEB alias
+* Build RAW = all numeric except mdate, seasons, z_* and AEB_aeb
 ds, has(type numeric)
 local Xraw `r(varlist)'
 local Xraw : list Xraw - mdate
 local Xraw : list Xraw - seasons
-local Xraw : list Xraw - AEB
+local Xraw : list Xraw - AEB_aeb
 capture unab zvars : z_*
 if !_rc {
     local Xraw : list Xraw - zvars
+}
+if strpos(" `Xraw' ", " AEB_aeb ") {
+    di as txt "Stripping residual AEB_aeb from raw PCA/FA inputs to enforce pre-OLS ban."
+    local Xraw : list Xraw - AEB_aeb
 }
 
 * Build Z = all z_* constructed above
 capture unab Z : z_*
 if _rc local Z ""
+local Z : list Z - z_AEB_aeb
+if strpos(" `Z' ", " z_AEB_aeb ") {
+    di as txt "Stripping residual z_AEB_aeb from standardized PCA/FA inputs to enforce pre-OLS ban."
+    local Z : list Z - z_AEB_aeb
+}
 
 local p_raw : word count `Xraw'
 local p_z   : word count `Z'
@@ -519,14 +432,7 @@ if `p_raw' >= 2 {
 
     capture drop F1_raw
     predict F1_raw
-    capture confirm variable AEB_aeb
-    if !_rc {
-        quietly corr AEB_aeb F1_raw
-        scalar s_raw = sign(r(rho))
-        if s_raw < 0 {
-            replace F1_raw = -F1_raw
-        }
-    }
+    di as txt "Skipping F1_raw sign alignment with AEB_aeb prior to OLS."
     rename F1_raw AEB_like_raw
     preserve
         keep mdate AEB_like_raw
@@ -555,14 +461,7 @@ if `p_z' >= 2 {
 
     capture drop F1_z
     predict F1_z
-    capture confirm variable z_AEB_aeb
-    if !_rc {
-        quietly corr z_AEB_aeb F1_z
-        scalar s_z = sign(r(rho))
-        if s_z < 0 {
-            replace F1_z = -F1_z
-        }
-    }
+    di as txt "Skipping F1_z sign alignment with z_AEB_aeb prior to OLS."
     rename F1_z AEB_like_z
     preserve
         keep mdate AEB_like_z
