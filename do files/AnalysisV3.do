@@ -566,275 +566,69 @@ if !_rc {
 **************************************************************
 * D) PCA + FA WITHOUT corn_close and sb_close (nopxs)
 **************************************************************
-
-*******************************************************
-* D1) RAW (nominal) variables — NO corn/soy prices
-*******************************************************
 preserve
+    * Load the aebcorrsv3pca dataset
     use "$PROC\aebcorrsv3pca.dta", clear
 
-    * Build raw list directly from the snapshot
-    ds, has(type numeric)
-    local Xsnap_nopxs `r(varlist)'
-    local Xsnap_nopxs : list Xsnap_nopxs - mdate
+    * Drop corn_close and sb_close
+    drop corn_close sb_close
 
-    ds se_*, has(type numeric)
-    local seasons_snap `r(varlist)'
-    local Xsnap_nopxs : list Xsnap_nopxs - seasons_snap
+    * Drop mdate and season dummies for analysis
+    drop mdate se_spring se_summer se_fall se_winter
 
-    capture unab drop_z : z_*
-    if !_rc local Xsnap_nopxs : list Xsnap_nopxs - drop_z
+    * Get list of remaining variables for PCA/FA
+    ds
+    local varlist_nopxs `r(varlist)'
 
-    local Xsnap_nopxs : list Xsnap_nopxs - AEB_aeb
-    local Xsnap_nopxs : list Xsnap_nopxs - AEB
+    di as result "=== PCA/FA without corn_close and sb_close ==="
+    di as result "Variables included: `varlist_nopxs'"
 
-    * EXCLUDE corn_close and sb_close
-    local Xsnap_nopxs : list Xsnap_nopxs - corn_close
-    local Xsnap_nopxs : list Xsnap_nopxs - sb_close
+    * Run PCA with 3 components
+    pca `varlist_nopxs', comp(3)
+    rotate, varimax blanks(.3)
 
-    local Xsnap_nopxs : list retoken Xsnap_nopxs
-
-    local p_snap_nopxs : word count `Xsnap_nopxs'
-    if `p_snap_nopxs' < 2 {
-        di as txt "No variables available for RAW nopxs PCA/FA snapshot once exclusions applied."
-    }
-    else {
-        local ncomp_snap_nopxs = cond(`p_snap_nopxs' >= 3, 3, `p_snap_nopxs')
-
-        quietly describe `Xsnap_nopxs'
-        quietly summarize `Xsnap_nopxs'
-        quietly corr `Xsnap_nopxs'
-
-        * PCA (RAW nopxs) on snapshot vars
-        pca `Xsnap_nopxs'
-        screeplot, name(G_scree_raw_nopxs, replace)
-        screeplot, yline(1) name(G_scree_raw_nopxs_y1, replace)
-        pca `Xsnap_nopxs', mineigen(1)
-        pca `Xsnap_nopxs', comp(`ncomp_snap_nopxs')
-        pca `Xsnap_nopxs', comp(`ncomp_snap_nopxs') blanks(.3)
-        rotate, varimax
-        rotate, varimax blanks(.3)
-        rotate, clear
-        rotate, promax
-        rotate, promax blanks(.3)
-        rotate, clear
-
-        estat loadings
-        matrix L_pca_raw_nopxs = e(L)
-        preserve
-            clear
-            svmat double L_pca_raw_nopxs, names(col)
-            gen variable = ""
-            local rn : rownames L_pca_raw_nopxs
-            local i = 1
-            foreach r of local rn {
-                replace variable = "`r'" in `i'
-                local ++i
-            }
-            order variable
-            export delimited using "$TAB\T_loadings_pca_raw_varimax_nopxs`SUF'.csv", replace
-        restore
-
-        * PCA scores -> *_raw_nopxs
-        local pcs_raw_nopxs
-        forvalues i = 1/`ncomp_snap_nopxs' {
-            local pcs_raw_nopxs `pcs_raw_nopxs' pc`i'
-        }
-        capture drop `pcs_raw_nopxs'
-        predict `pcs_raw_nopxs', score
-        foreach v of local pcs_raw_nopxs {
-            rename `v' `v'_raw_nopxs
-        }
-
-        * KMO
-        estat kmo
-
-        * FACTOR (RAW nopxs)
-        factor `Xsnap_nopxs'
-        screeplot, name(G_scree_raw_fa_nopxs, replace)
-        screeplot, yline(1) name(G_scree_raw_fa_nopxs_y1, replace)
-        factor `Xsnap_nopxs', mineigen(1)
-        factor `Xsnap_nopxs', factor(`ncomp_snap_nopxs')
-        factor `Xsnap_nopxs', factor(`ncomp_snap_nopxs') blanks(0.3)
-        rotate, varimax
-        rotate, varimax blanks(.3)
-        rotate, clear
-        rotate, promax
-        rotate, promax blanks(.3)
-        rotate, clear
-
-        estat common
-        matrix L_fa_raw_nopxs = e(L)
-        preserve
-            clear
-            svmat double L_fa_raw_nopxs, names(col)
-            gen variable = ""
-            local rn : rownames L_fa_raw_nopxs
-            local i = 1
-            foreach r of local rn {
-                replace variable = "`r'" in `i'
-                local ++i
-            }
-            order variable
-            export delimited using "$TAB\T_loadings_fa_raw_varimax_nopxs`SUF'.csv", replace
-        restore
-
-        * FA scores -> *_raw_nopxs
-        local fs_raw_nopxs
-        forvalues i = 1/`ncomp_snap_nopxs' {
-            local fs_raw_nopxs `fs_raw_nopxs' f`i'
-        }
-        capture drop `fs_raw_nopxs'
-        predict `fs_raw_nopxs'
-        foreach v of local fs_raw_nopxs {
-            rename `v' `v'_raw_nopxs
-        }
-
-        * Reliability + Bartlett (RAW nopxs)
-        alpha `Xsnap_nopxs'
-        cap which factortest
-        if _rc ssc install factortest, replace
-        factortest `Xsnap_nopxs'
-
-        * Save raw nopxs PCA/FA scores from the snapshot
-        local have_raw_nopxs ""
-        capture unab have_raw_nopxs : pc*_raw_nopxs f*_raw_nopxs
-        if !_rc {
-            preserve
-                keep mdate `have_raw_nopxs'
-                compress
-                save "$PROC\fa_pca_scores_raw_nopxs`SUF'.dta", replace
-            restore
-            di as result "✅ Saved: $PROC\fa_pca_scores_raw_nopxs`SUF'.dta"
-        }
-    }
-restore
-
-*******************************************************
-* D2) STANDARDIZED (z_) variables — NO corn/soy prices
-*******************************************************
-* Build Z_nopxs = all z_* excluding z_corn_close and z_sb_close
-capture unab Z_nopxs : z_*
-if _rc local Z_nopxs ""
-local Z_nopxs : list Z_nopxs - z_AEB_aeb
-local Z_nopxs : list Z_nopxs - z_corn_close
-local Z_nopxs : list Z_nopxs - z_sb_close
-
-local p_z_nopxs : word count `Z_nopxs'
-
-if `p_z_nopxs' >= 2 {
-    local ncomp_z_nopxs = cond(`p_z_nopxs' >= 3, 3, `p_z_nopxs')
-
-    quietly describe `Z_nopxs'
-    quietly summarize `Z_nopxs'
-    quietly corr `Z_nopxs'
-
-    * PCA (Z nopxs)
-    pca `Z_nopxs'
-    screeplot, name(G_scree_z_nopxs, replace)
-    screeplot, yline(1) name(G_scree_z_nopxs_y1, replace)
-    pca `Z_nopxs', mineigen(1)
-    pca `Z_nopxs', comp(`ncomp_z_nopxs')
-    pca `Z_nopxs', comp(`ncomp_z_nopxs') blanks(.3)
-    rotate, varimax
-
+    * Export PCA loadings
     estat loadings
-    matrix L_pca_z_nopxs = e(L)
+    matrix L_pca_nopxs = e(L)
+    tempfile pca_temp
     preserve
         clear
-        svmat double L_pca_z_nopxs, names(col)
+        svmat double L_pca_nopxs, names(col)
         gen variable = ""
-        local rn : rownames L_pca_z_nopxs
+        local rn : rownames L_pca_nopxs
         local i = 1
         foreach r of local rn {
             replace variable = "`r'" in `i'
             local ++i
         }
         order variable
-        export delimited using "$TAB\T_loadings_pca_z_varimax_nopxs`SUF'.csv", replace
+        export delimited using "$TAB\T_loadings_pca_nopxs`SUF'.csv", replace
+        di as result "Saved: $TAB\T_loadings_pca_nopxs`SUF'.csv"
     restore
 
-    * PCA scores -> *_z_nopxs
-    local pcs_z_nopxs
-    forvalues i = 1/`ncomp_z_nopxs' {
-        local pcs_z_nopxs `pcs_z_nopxs' pc`i'
-    }
-    capture drop `pcs_z_nopxs'
-    predict `pcs_z_nopxs', score
-    foreach v of local pcs_z_nopxs {
-        rename `v' `v'_z_nopxs
-    }
+    * Run Factor Analysis with 3 factors
+    factor `varlist_nopxs', factor(3)
+    rotate, varimax blanks(.3)
 
-    * KMO
-    estat kmo
-
-    * FACTOR (Z nopxs)
-    factor `Z_nopxs'
-    screeplot, name(G_scree_z_fa_nopxs, replace)
-    screeplot, yline(1) name(G_scree_z_fa_nopxs_y1, replace)
-    factor `Z_nopxs', mineigen(1)
-    factor `Z_nopxs', factor(`ncomp_z_nopxs')
-    factor `Z_nopxs', factor(`ncomp_z_nopxs') blanks(0.3)
-    rotate, varimax
-
-    estat common
-    matrix L_fa_z_nopxs = e(L)
+    * Export FA loadings
+    estat loadings
+    matrix L_fa_nopxs = e(L)
     preserve
         clear
-        svmat double L_fa_z_nopxs, names(col)
+        svmat double L_fa_nopxs, names(col)
         gen variable = ""
-        local rn : rownames L_fa_z_nopxs
+        local rn : rownames L_fa_nopxs
         local i = 1
         foreach r of local rn {
             replace variable = "`r'" in `i'
             local ++i
         }
         order variable
-        export delimited using "$TAB\T_loadings_fa_z_varimax_nopxs`SUF'.csv", replace
+        export delimited using "$TAB\T_loadings_fa_nopxs`SUF'.csv", replace
+        di as result "Saved: $TAB\T_loadings_fa_nopxs`SUF'.csv"
     restore
 
-    * FA scores -> *_z_nopxs
-    local fs_z_nopxs
-    forvalues i = 1/`ncomp_z_nopxs' {
-        local fs_z_nopxs `fs_z_nopxs' f`i'
-    }
-    capture drop `fs_z_nopxs'
-    predict `fs_z_nopxs'
-    foreach v of local fs_z_nopxs {
-        rename `v' `v'_z_nopxs
-    }
-
-    * Reliability + Bartlett (Z nopxs)
-    alpha `Z_nopxs'
-    cap which factortest
-    if _rc ssc install factortest, replace
-    factortest `Z_nopxs'
-}
-
-*******************************************************
-* D3) Save tidy score files for nopxs — robust to missing scores
-*******************************************************
-* RAW nopxs scores
-local have_raw_nopxs ""
-capture unab have_raw_nopxs : pc*_raw_nopxs f*_raw_nopxs
-if !_rc {
-    preserve
-        keep mdate `have_raw_nopxs'
-        compress
-        save "$PROC\fa_pca_scores_raw_nopxs`SUF'.dta", replace
-    restore
-}
-
-* Z nopxs scores
-local have_z_nopxs ""
-capture unab have_z_nopxs : pc*_z_nopxs f*_z_nopxs
-if !_rc {
-    preserve
-        keep mdate `have_z_nopxs'
-        compress
-        save "$PROC\fa_pca_scores_z_nopxs`SUF'.dta", replace
-    restore
-}
+restore
 
 **************************************************************
 * 6) Single–Factor "AEB-like" index (RAW and Z)
