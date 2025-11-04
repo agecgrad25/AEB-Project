@@ -616,7 +616,7 @@ preserve
     rotate, varimax blanks(.3)
 
     * Export FA loadings
-    estat loadings
+    estat common
     matrix L_fa_nopxs = e(L)
 
     clear
