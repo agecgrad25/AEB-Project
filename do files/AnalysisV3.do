@@ -138,13 +138,13 @@ program define build_aebcorrsv3pca
     syntax
 
     preserve
-        quietly use "`DATA_MAIN'", clear
+        quietly use "$PROC\aebcorrsv3.dta", clear
 
         * Remove AEB-specific series and any standardized z_* remnants
         capture drop AEB_aeb AEB z_*
 
         compress
-        save "`DATA_PCA'", replace
+        save "$PROC\aebcorrsv3pca.dta", replace
     restore
 end
 
