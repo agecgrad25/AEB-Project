@@ -383,6 +383,9 @@ preserve
             rename `v' `v'_raw
         }
 
+        * Reload clean data for FA
+        use `raw_data', clear
+
         * ---- FACTOR ANALYSIS (RAW) with Kaiser criterion ----
         factor `Xsnap', mineigen(1)
         screeplot, yline(1) name(G_scree_raw_fa_y1, replace)
@@ -424,6 +427,33 @@ preserve
         cap which factortest
         if _rc ssc install factortest, replace
         factortest `Xsnap'
+
+        * Reload clean data and predict BOTH PCA and FA scores for saving
+        use `raw_data', clear
+
+        * Predict PCA scores
+        quietly pca `Xsnap', mineigen(1)
+        quietly rotate, varimax blanks(.3)
+        local pcs_raw
+        forvalues i = 1/`ncomp_snap' {
+            local pcs_raw `pcs_raw' pc`i'
+        }
+        predict `pcs_raw', score
+        foreach v of local pcs_raw {
+            rename `v' `v'_raw
+        }
+
+        * Predict FA scores
+        quietly factor `Xsnap', mineigen(1)
+        quietly rotate, varimax blanks(.3)
+        local fs_raw
+        forvalues i = 1/`nfact_snap' {
+            local fs_raw `fs_raw' f`i'
+        }
+        predict `fs_raw'
+        foreach v of local fs_raw {
+            rename `v' `v'_raw
+        }
 
         * Save raw PCA/FA scores
         local have_raw ""
@@ -496,6 +526,9 @@ if `p_z' >= 2 {
         rename `v' `v'_z
     }
 
+    * Reload clean data for FA
+    use `z_data', clear
+
     * ---- FACTOR ANALYSIS (Z) with Kaiser criterion ----
     factor `Z', mineigen(1)
     screeplot, yline(1) name(G_scree_z_fa_y1, replace)
@@ -537,6 +570,33 @@ if `p_z' >= 2 {
     cap which factortest
     if _rc ssc install factortest, replace
     factortest `Z'
+
+    * Reload clean data and predict BOTH PCA and FA scores for Section C to save
+    use `z_data', clear
+
+    * Predict PCA scores
+    quietly pca `Z', mineigen(1)
+    quietly rotate, varimax blanks(.3)
+    local pcs_z
+    forvalues i = 1/`ncomp_z' {
+        local pcs_z `pcs_z' pc`i'
+    }
+    predict `pcs_z', score
+    foreach v of local pcs_z {
+        rename `v' `v'_z
+    }
+
+    * Predict FA scores
+    quietly factor `Z', mineigen(1)
+    quietly rotate, varimax blanks(.3)
+    local fs_z
+    forvalues i = 1/`nfact_z' {
+        local fs_z `fs_z' f`i'
+    }
+    predict `fs_z'
+    foreach v of local fs_z {
+        rename `v' `v'_z
+    }
 }
 
 **************************************************************
