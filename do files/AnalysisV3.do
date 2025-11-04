@@ -635,6 +635,80 @@ preserve
 restore
 
 **************************************************************
+* E) PCA + FA for Z-SCORED variables WITHOUT corn/soy prices (z_nopxs)
+**************************************************************
+preserve
+    * Load the main dataset with z-scored variables
+    use "$PROC\aebcorrsv3.dta", clear
+
+    * Keep only z_* variables
+    keep mdate z_*
+
+    * Drop z_AEB_aeb, z_corn_close, and z_sb_close
+    drop z_AEB_aeb z_corn_close z_sb_close
+
+    * Drop mdate for analysis
+    drop mdate
+
+    * Get list of remaining z-scored variables for PCA/FA
+    ds
+    local varlist_z_nopxs `r(varlist)'
+
+    di as result "=== PCA/FA for z-scored variables without corn/soy prices ==="
+    di as result "Variables included: `varlist_z_nopxs'"
+
+    * Save current data to tempfile for reloading after exports
+    tempfile z_nopxs_data
+    save `z_nopxs_data', replace
+
+    * Run PCA using Kaiser criterion (eigenvalue > 1)
+    pca `varlist_z_nopxs', mineigen(1)
+    rotate, varimax blanks(.3)
+
+    * Export PCA loadings
+    estat loadings
+    matrix L_pca_z_nopxs = e(L)
+
+    clear
+    svmat double L_pca_z_nopxs, names(col)
+    gen variable = ""
+    local rn : rownames L_pca_z_nopxs
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_loadings_pca_z_nopxs`SUF'.csv", replace
+    di as result "Saved: $TAB\T_loadings_pca_z_nopxs`SUF'.csv"
+
+    * Reload data for FA
+    use `z_nopxs_data', clear
+
+    * Run Factor Analysis using Kaiser criterion (eigenvalue > 1)
+    factor `varlist_z_nopxs', mineigen(1)
+    rotate, varimax blanks(.3)
+
+    * Export FA loadings
+    estat common
+    matrix L_fa_z_nopxs = e(L)
+
+    clear
+    svmat double L_fa_z_nopxs, names(col)
+    gen variable = ""
+    local rn : rownames L_fa_z_nopxs
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_loadings_fa_z_nopxs`SUF'.csv", replace
+    di as result "Saved: $TAB\T_loadings_fa_z_nopxs`SUF'.csv"
+
+restore
+
+**************************************************************
 * 6) Single–Factor "AEB-like" index (RAW and Z)
 **************************************************************
 local p_raw : word count `Xraw'
