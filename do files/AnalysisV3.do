@@ -29,6 +29,26 @@ if _rc {
 * Pre-OLS safeguards: drop any lingering standardized AEB so it cannot be reused
 capture drop z_AEB_aeb
 
+* Helper: ensure an AEB-free snapshot exists for RAW PCA/FA routines
+capture program drop build_aebcorrsv3pca
+program define build_aebcorrsv3pca
+    syntax
+
+    preserve
+        quietly use "$PROC\aebcorrsv3.dta", clear
+
+        * Remove AEB-specific series and any standardized z_* remnants
+        capture drop AEB_aeb
+        capture drop AEB
+        capture drop z_*
+
+        compress
+        save "$PROC\aebcorrsv3pca.dta", replace
+    restore
+end
+
+quietly build_aebcorrsv3pca
+
 * Identify numeric vars; exclude mdate and SEASON dummies (no Fourier terms exist)
 ds, has(type numeric)
 local allnum `r(varlist)'
@@ -81,19 +101,41 @@ preserve
     tempfile out
     tempname ph
     postfile `ph' str64 var double rho int N using "`out'", replace
- * Non-season variables (use z_ versions)
+    * Non-season variables — correlate nominal series (no z_)
     foreach v of local safe_others {
-        quietly corr z_AEB_aeb z_`v'
+        quietly corr AEB_aeb `v'
         post `ph' ("`v'") (r(rho)) (r(N))
     }
 
-    * Season dummies (use raw se_* with z_AEB_aeb)
+    * Season dummies (still pair with nominal AEB_aeb)
     if "`seasons'" != "" {
         foreach s of local seasons {
-            quietly corr z_AEB_aeb `s'
+            quietly corr AEB_aeb `s'
             post `ph' ("`s'") (r(rho)) (r(N))
         }
     }
+
+    postclose `ph'
+
+    use "`out'", clear
+    drop if missing(rho)
+
+    quietly count
+    if r(N) == 0 {
+        di as txt "No valid pairwise correlations between AEB_aeb and the candidate variables."
+    }
+    else {
+        gen double abs_rho = abs(rho)
+        gsort -abs_rho
+
+        order var rho N
+        format rho %6.3f
+        format N   %9.0f
+
+        export delimited using "$TAB\T_corr_pairwise`SUF'.csv", replace
+        drop abs_rho
+    }
+restore
 
 * ------------ 2B) Full correlation matrix (incl. seasons) ------------
 * Build matrix varlist without AEB_aeb (per pre-OLS exclusion)
@@ -260,52 +302,60 @@ capture unab Z : z_*
 if _rc local Z ""
 local Z : list Z - z_AEB_aeb
 
-local p_raw : word count `Xraw'
-local p_z   : word count `Z'
-if (`p_raw' < 2 & `p_z' < 2) {
-    di as err "Not enough variables for PCA/FA."
-    exit 111
-}
-local ncomp_raw = cond(`p_raw' >= 3, 3, `p_raw')
-local ncomp_z   = cond(`p_z'   >= 3, 3, `p_z')
+local p_z : word count `Z'
+local ncomp_z = cond(`p_z' >= 3, 3, `p_z')
+local p_snap = 0
 
 *******************************************************
 * A) RAW (nominal) variables
 *******************************************************
-if `p_raw' >= 2 {
-    local pcs_raw ""
-    local pcs_raw_out ""
-    forvalues i = 1/`ncomp_raw' {
-        local pcs_raw `pcs_raw' pc`i'
-        local pcs_raw_out `pcs_raw_out' pc`i'_raw
+preserve
+    use "$PROC\aebcorrsv3pca.dta", clear
+
+    * Build raw list directly from the snapshot
+    ds, has(type numeric)
+    local Xsnap `r(varlist)'
+    local Xsnap : list Xsnap - mdate
+
+    ds se_*, has(type numeric)
+    local seasons_snap `r(varlist)'
+    local Xsnap : list Xsnap - seasons_snap
+
+    capture unab drop_z : z_*
+    if !_rc local Xsnap : list Xsnap - drop_z
+
+    local Xsnap : list Xsnap - AEB_aeb
+    local Xsnap : list Xsnap - AEB
+    local Xsnap : list retoken Xsnap
+
+    local p_snap : word count `Xsnap'
+    if `p_snap' < 2 {
+        di as txt "No variables available for RAW PCA/FA snapshot once exclusions applied."
     }
-    local fs_raw ""
-    local fs_raw_out ""
-    forvalues i = 1/`ncomp_raw' {
-        local fs_raw `fs_raw' f`i'
-        local fs_raw_out `fs_raw_out' f`i'_raw
-    }
-    tempfile raw_scores
+    else {
+        local ncomp_snap = cond(`p_snap' >= 3, 3, `p_snap')
 
-    preserve
-        use `aebcorrsv3pca', clear
+        quietly describe `Xsnap'
+        quietly summarize `Xsnap'
+        quietly corr `Xsnap'
 
-        quietly describe `Xraw'
-        quietly summarize `Xraw'
-        quietly corr `Xraw'
-
-        * PCA (RAW)
-        pca `Xraw'
+        * PCA (RAW) on snapshot vars
+        pca `Xsnap'
         screeplot, name(G_scree_raw, replace)
         screeplot, yline(1) name(G_scree_raw_y1, replace)
-        pca `Xraw', mineigen(1)
-        pca `Xraw', comp(`ncomp_raw')
-        pca `Xraw', comp(`ncomp_raw') blanks(.3)
+        pca `Xsnap', mineigen(1)
+        pca `Xsnap', comp(`ncomp_snap')
+        pca `Xsnap', comp(`ncomp_snap') blanks(.3)
         rotate, varimax
+        rotate, varimax blanks(.3)
+        rotate, clear
+        rotate, promax
+        rotate, promax blanks(.3)
+        rotate, clear
 
         estat loadings
         matrix L_pca_raw = e(L)
-        preserve
+        
             clear
             svmat double L_pca_raw, names(col)
             gen variable = ""
@@ -320,26 +370,32 @@ if `p_raw' >= 2 {
         restore
 
         * PCA scores -> *_raw
-        foreach v of local pcs_raw_out {
-            capture drop `v'
+        local pcs_raw
+        forvalues i = 1/`ncomp_snap' {
+            local pcs_raw `pcs_raw' pc`i'
         }
         capture drop `pcs_raw'
         predict `pcs_raw', score
-        forvalues i = 1/`ncomp_raw' {
-            rename pc`i' pc`i'_raw
+        foreach v of local pcs_raw {
+            rename `v' `v'_raw
         }
 
         * KMO
         estat kmo
 
         * FACTOR (RAW)
-        factor `Xraw'
+        factor `Xsnap'
         screeplot, name(G_scree_raw_fa, replace)
         screeplot, yline(1) name(G_scree_raw_fa_y1, replace)
-        factor `Xraw', mineigen(1)
-        factor `Xraw', factor(`ncomp_raw')
-        factor `Xraw', factor(`ncomp_raw') blanks(0.3)
+        factor `Xsnap', mineigen(1)
+        factor `Xsnap', factor(`ncomp_snap')
+        factor `Xsnap', factor(`ncomp_snap') blanks(0.3)
         rotate, varimax
+        rotate, varimax blanks(.3)
+        rotate, clear
+        rotate, promax
+        rotate, promax blanks(.3)
+        rotate, clear
 
         estat common
         matrix L_fa_raw = e(L)
@@ -358,34 +414,38 @@ if `p_raw' >= 2 {
         restore
 
         * FA scores -> *_raw
-        foreach v of local fs_raw_out {
-            capture drop `v'
+        local fs_raw
+        forvalues i = 1/`ncomp_snap' {
+            local fs_raw `fs_raw' f`i'
         }
         capture drop `fs_raw'
         predict `fs_raw'
-        forvalues i = 1/`ncomp_raw' {
-            rename f`i' f`i'_raw
+        foreach v of local fs_raw {
+            rename `v' `v'_raw
         }
 
         * Reliability + Bartlett (RAW)
-        alpha `Xraw'
+        alpha `Xsnap'
         cap which factortest
         if _rc ssc install factortest, replace
-        factortest `Xraw'
+        factortest `Xsnap'
 
-        keep mdate `pcs_raw_out' `fs_raw_out'
-        compress
-        save `raw_scores'
-    restore
-
-    foreach v of local pcs_raw_out {
-        capture drop `v'
+        * Save raw PCA/FA scores from the snapshot
+        local have_raw ""
+        capture unab have_raw : pc*_raw f*_raw
+        if !_rc {
+            preserve
+                keep mdate `have_raw'
+                compress
+                save "$PROC\fa_pca_scores_raw`SUF'.dta", replace
+            restore
+            di as result "✅ Saved: $PROC\fa_pca_scores_raw`SUF'.dta"
+        }
     }
-    foreach v of local fs_raw_out {
-        capture drop `v'
-    }
 
-    merge 1:1 mdate using `raw_scores', nogen
+if (`p_snap' < 2 & `p_z' < 2) {
+    di as err "Not enough variables for PCA/FA."
+    exit 111
 }
 
 *******************************************************

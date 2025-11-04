@@ -3,7 +3,11 @@ clear all
 set more off
 set rmsg on
 
+*Run on Work PC
 global PROJ "C:\Users\adolbowv\OneDrive - purdue.edu\Work Projects\Barometer correlations\Stata Files"
+
+*Run on own pc
+*global PROJ "C:\Users\acers\OneDrive - purdue.edu\Work Projects\Barometer correlations\Stata Files"
 
 global CODE "$PROJ\do files"
 global RAW  "$PROJ\Raw Datasets"
