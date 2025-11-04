@@ -583,6 +583,10 @@ preserve
     di as result "=== PCA/FA without corn_close and sb_close ==="
     di as result "Variables included: `varlist_nopxs'"
 
+    * Save current data to tempfile for reloading after exports
+    tempfile nopxs_data
+    save `nopxs_data', replace
+
     * Run PCA using Kaiser criterion (eigenvalue > 1)
     pca `varlist_nopxs', mineigen(1)
     rotate, varimax blanks(.3)
@@ -590,21 +594,22 @@ preserve
     * Export PCA loadings
     estat loadings
     matrix L_pca_nopxs = e(L)
-    tempfile pca_temp
-    preserve
-        clear
-        svmat double L_pca_nopxs, names(col)
-        gen variable = ""
-        local rn : rownames L_pca_nopxs
-        local i = 1
-        foreach r of local rn {
-            replace variable = "`r'" in `i'
-            local ++i
-        }
-        order variable
-        export delimited using "$TAB\T_loadings_pca_nopxs`SUF'.csv", replace
-        di as result "Saved: $TAB\T_loadings_pca_nopxs`SUF'.csv"
-    restore
+
+    clear
+    svmat double L_pca_nopxs, names(col)
+    gen variable = ""
+    local rn : rownames L_pca_nopxs
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_loadings_pca_nopxs`SUF'.csv", replace
+    di as result "Saved: $TAB\T_loadings_pca_nopxs`SUF'.csv"
+
+    * Reload data for FA
+    use `nopxs_data', clear
 
     * Run Factor Analysis using Kaiser criterion (eigenvalue > 1)
     factor `varlist_nopxs', mineigen(1)
@@ -613,20 +618,19 @@ preserve
     * Export FA loadings
     estat loadings
     matrix L_fa_nopxs = e(L)
-    preserve
-        clear
-        svmat double L_fa_nopxs, names(col)
-        gen variable = ""
-        local rn : rownames L_fa_nopxs
-        local i = 1
-        foreach r of local rn {
-            replace variable = "`r'" in `i'
-            local ++i
-        }
-        order variable
-        export delimited using "$TAB\T_loadings_fa_nopxs`SUF'.csv", replace
-        di as result "Saved: $TAB\T_loadings_fa_nopxs`SUF'.csv"
-    restore
+
+    clear
+    svmat double L_fa_nopxs, names(col)
+    gen variable = ""
+    local rn : rownames L_fa_nopxs
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_loadings_fa_nopxs`SUF'.csv", replace
+    di as result "Saved: $TAB\T_loadings_fa_nopxs`SUF'.csv"
 
 restore
 
