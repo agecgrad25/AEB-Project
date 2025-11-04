@@ -583,8 +583,8 @@ preserve
     di as result "=== PCA/FA without corn_close and sb_close ==="
     di as result "Variables included: `varlist_nopxs'"
 
-    * Run PCA with 3 components
-    pca `varlist_nopxs', comp(3)
+    * Run PCA using Kaiser criterion (eigenvalue > 1)
+    pca `varlist_nopxs', mineigen(1)
     rotate, varimax blanks(.3)
 
     * Export PCA loadings
@@ -606,8 +606,8 @@ preserve
         di as result "Saved: $TAB\T_loadings_pca_nopxs`SUF'.csv"
     restore
 
-    * Run Factor Analysis with 3 factors
-    factor `varlist_nopxs', factor(3)
+    * Run Factor Analysis using Kaiser criterion (eigenvalue > 1)
+    factor `varlist_nopxs', mineigen(1)
     rotate, varimax blanks(.3)
 
     * Export FA loadings
