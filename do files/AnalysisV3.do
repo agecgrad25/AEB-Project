@@ -333,115 +333,109 @@ preserve
         di as txt "No variables available for RAW PCA/FA snapshot once exclusions applied."
     }
     else {
-        local ncomp_snap = cond(`p_snap' >= 3, 3, `p_snap')
+        di as result "=== RAW PCA/FA Analysis ==="
+        di as result "Variables included: `Xsnap'"
 
         quietly describe `Xsnap'
         quietly summarize `Xsnap'
         quietly corr `Xsnap'
 
-        * PCA (RAW) on snapshot vars
-        pca `Xsnap'
-        screeplot, name(G_scree_raw, replace)
-        screeplot, yline(1) name(G_scree_raw_y1, replace)
-        pca `Xsnap', mineigen(1)
-        pca `Xsnap', comp(`ncomp_snap')
-        pca `Xsnap', comp(`ncomp_snap') blanks(.3)
-        rotate, varimax
-        rotate, varimax blanks(.3)
-        rotate, clear
-        rotate, promax
-        rotate, promax blanks(.3)
-        rotate, clear
+        * Save current data to tempfile
+        tempfile raw_data
+        save `raw_data', replace
 
+        * ---- PCA (RAW) with Kaiser criterion ----
+        pca `Xsnap', mineigen(1)
+        screeplot, yline(1) name(G_scree_raw_y1, replace)
+        rotate, varimax blanks(.3)
+
+        * KMO test
+        estat kmo
+
+        * Export PCA loadings
         estat loadings
         matrix L_pca_raw = e(L)
-        
-            clear
-            svmat double L_pca_raw, names(col)
-            gen variable = ""
-            local rn : rownames L_pca_raw
-            local i = 1
-            foreach r of local rn {
-                replace variable = "`r'" in `i'
-                local ++i
-            }
-            order variable
-            export delimited using "$TAB\T_loadings_pca_raw_varimax`SUF'.csv", replace
-        restore
+        local ncomp_snap = colsof(L_pca_raw)
 
-        * PCA scores -> *_raw
+        clear
+        svmat double L_pca_raw, names(col)
+        gen variable = ""
+        local rn : rownames L_pca_raw
+        local i = 1
+        foreach r of local rn {
+            replace variable = "`r'" in `i'
+            local ++i
+        }
+        order variable
+        export delimited using "$TAB\T_loadings_pca_raw_varimax`SUF'.csv", replace
+        di as result "Saved: $TAB\T_loadings_pca_raw_varimax`SUF'.csv"
+
+        * Reload data and predict PCA scores
+        use `raw_data', clear
+        quietly pca `Xsnap', mineigen(1)
+        quietly rotate, varimax blanks(.3)
         local pcs_raw
         forvalues i = 1/`ncomp_snap' {
             local pcs_raw `pcs_raw' pc`i'
         }
-        capture drop `pcs_raw'
         predict `pcs_raw', score
         foreach v of local pcs_raw {
             rename `v' `v'_raw
         }
 
-        * KMO
-        estat kmo
-
-        * FACTOR (RAW)
-        factor `Xsnap'
-        screeplot, name(G_scree_raw_fa, replace)
-        screeplot, yline(1) name(G_scree_raw_fa_y1, replace)
+        * ---- FACTOR ANALYSIS (RAW) with Kaiser criterion ----
         factor `Xsnap', mineigen(1)
-        factor `Xsnap', factor(`ncomp_snap')
-        factor `Xsnap', factor(`ncomp_snap') blanks(0.3)
-        rotate, varimax
+        screeplot, yline(1) name(G_scree_raw_fa_y1, replace)
         rotate, varimax blanks(.3)
-        rotate, clear
-        rotate, promax
-        rotate, promax blanks(.3)
-        rotate, clear
 
+        * Export FA loadings
         estat common
         matrix L_fa_raw = e(L)
-        preserve
-            clear
-            svmat double L_fa_raw, names(col)
-            gen variable = ""
-            local rn : rownames L_fa_raw
-            local i = 1
-            foreach r of local rn {
-                replace variable = "`r'" in `i'
-                local ++i
-            }
-            order variable
-            export delimited using "$TAB\T_loadings_fa_raw_varimax`SUF'.csv", replace
-        restore
+        local nfact_snap = colsof(L_fa_raw)
 
-        * FA scores -> *_raw
+        clear
+        svmat double L_fa_raw, names(col)
+        gen variable = ""
+        local rn : rownames L_fa_raw
+        local i = 1
+        foreach r of local rn {
+            replace variable = "`r'" in `i'
+            local ++i
+        }
+        order variable
+        export delimited using "$TAB\T_loadings_fa_raw_varimax`SUF'.csv", replace
+        di as result "Saved: $TAB\T_loadings_fa_raw_varimax`SUF'.csv"
+
+        * Reload data and predict FA scores
+        use `raw_data', clear
+        quietly factor `Xsnap', mineigen(1)
+        quietly rotate, varimax blanks(.3)
         local fs_raw
-        forvalues i = 1/`ncomp_snap' {
+        forvalues i = 1/`nfact_snap' {
             local fs_raw `fs_raw' f`i'
         }
-        capture drop `fs_raw'
         predict `fs_raw'
         foreach v of local fs_raw {
             rename `v' `v'_raw
         }
 
-        * Reliability + Bartlett (RAW)
+        * Reliability + Bartlett tests
         alpha `Xsnap'
         cap which factortest
         if _rc ssc install factortest, replace
         factortest `Xsnap'
 
-        * Save raw PCA/FA scores from the snapshot
+        * Save raw PCA/FA scores
         local have_raw ""
         capture unab have_raw : pc*_raw f*_raw
         if !_rc {
-            preserve
-                keep mdate `have_raw'
-                compress
-                save "$PROC\fa_pca_scores_raw`SUF'.dta", replace
-            restore
-            di as result "✅ Saved: $PROC\fa_pca_scores_raw`SUF'.dta"
+            keep mdate `have_raw'
+            compress
+            save "$PROC\fa_pca_scores_raw`SUF'.dta", replace
+            di as result "Saved: $PROC\fa_pca_scores_raw`SUF'.dta"
         }
     }
+restore
 
 if (`p_snap' < 2 & `p_z' < 2) {
     di as err "Not enough variables for PCA/FA."
@@ -452,86 +446,93 @@ if (`p_snap' < 2 & `p_z' < 2) {
 * B) STANDARDIZED (z_) variables
 *******************************************************
 if `p_z' >= 2 {
+    di as result "=== STANDARDIZED (z_) PCA/FA Analysis ==="
+    di as result "Variables included: `Z'"
+
     quietly describe `Z'
     quietly summarize `Z'
     quietly corr `Z'
 
-    * PCA (Z)
-    pca `Z'
-    screeplot, name(G_scree_z, replace)
-    screeplot, yline(1) name(G_scree_z_y1, replace)
-    pca `Z', mineigen(1)
-    pca `Z', comp(`ncomp_z')
-    pca `Z', comp(`ncomp_z') blanks(.3)
-    rotate, varimax
+    * Save current data to tempfile
+    tempfile z_data
+    save `z_data', replace
 
+    * ---- PCA (Z) with Kaiser criterion ----
+    pca `Z', mineigen(1)
+    screeplot, yline(1) name(G_scree_z_y1, replace)
+    rotate, varimax blanks(.3)
+
+    * KMO test
+    estat kmo
+
+    * Export PCA loadings
     estat loadings
     matrix L_pca_z = e(L)
-    preserve
-        clear
-        svmat double L_pca_z, names(col)
-        gen variable = ""
-        local rn : rownames L_pca_z
-        local i = 1
-        foreach r of local rn {
-            replace variable = "`r'" in `i'
-            local ++i
-        }
-        order variable
-        export delimited using "$TAB\T_loadings_pca_z_varimax`SUF'.csv", replace
-    restore
+    local ncomp_z = colsof(L_pca_z)
 
-    * PCA scores -> *_z
+    clear
+    svmat double L_pca_z, names(col)
+    gen variable = ""
+    local rn : rownames L_pca_z
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_loadings_pca_z_varimax`SUF'.csv", replace
+    di as result "Saved: $TAB\T_loadings_pca_z_varimax`SUF'.csv"
+
+    * Reload data and predict PCA scores
+    use `z_data', clear
+    quietly pca `Z', mineigen(1)
+    quietly rotate, varimax blanks(.3)
     local pcs_z
     forvalues i = 1/`ncomp_z' {
         local pcs_z `pcs_z' pc`i'
     }
-    capture drop `pcs_z'
     predict `pcs_z', score
     foreach v of local pcs_z {
         rename `v' `v'_z
     }
 
-    * KMO
-    estat kmo
-
-    * FACTOR (Z)
-    factor `Z'
-    screeplot, name(G_scree_z_fa, replace)
-    screeplot, yline(1) name(G_scree_z_fa_y1, replace)
+    * ---- FACTOR ANALYSIS (Z) with Kaiser criterion ----
     factor `Z', mineigen(1)
-    factor `Z', factor(`ncomp_z')
-    factor `Z', factor(`ncomp_z') blanks(0.3)
-    rotate, varimax
+    screeplot, yline(1) name(G_scree_z_fa_y1, replace)
+    rotate, varimax blanks(.3)
 
+    * Export FA loadings
     estat common
     matrix L_fa_z = e(L)
-    preserve
-        clear
-        svmat double L_fa_z, names(col)
-        gen variable = ""
-        local rn : rownames L_fa_z
-        local i = 1
-        foreach r of local rn {
-            replace variable = "`r'" in `i'
-            local ++i
-        }
-        order variable
-        export delimited using "$TAB\T_loadings_fa_z_varimax`SUF'.csv", replace
-    restore
+    local nfact_z = colsof(L_fa_z)
 
-    * FA scores -> *_z
+    clear
+    svmat double L_fa_z, names(col)
+    gen variable = ""
+    local rn : rownames L_fa_z
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_loadings_fa_z_varimax`SUF'.csv", replace
+    di as result "Saved: $TAB\T_loadings_fa_z_varimax`SUF'.csv"
+
+    * Reload data and predict FA scores
+    use `z_data', clear
+    quietly factor `Z', mineigen(1)
+    quietly rotate, varimax blanks(.3)
     local fs_z
-    forvalues i = 1/`ncomp_z' {
+    forvalues i = 1/`nfact_z' {
         local fs_z `fs_z' f`i'
     }
-    capture drop `fs_z'
     predict `fs_z'
     foreach v of local fs_z {
         rename `v' `v'_z
     }
 
-    * Reliability + Bartlett (Z)
+    * Reliability + Bartlett tests
     alpha `Z'
     cap which factortest
     if _rc ssc install factortest, replace
