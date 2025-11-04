@@ -1,13 +1,377 @@
 *******************************************************
-* 03_analysis_simple_v19.do — simple (Stata 19)
-* Input: $PROC\aebcorrsv3.dta  (post-2014, +corn/soy prices & vols, +Seasons)*******************************************************
+* 03_analysis_simple_v19.do — simple (Stata 19) - REFACTORED
+* Input: $PROC\aebcorrsv3.dta  (post-2014, +corn/soy prices & vols, +Seasons)
+*******************************************************
 
 version 19.0
 clear all
 set more off
 
-* 0) Load and set time
-use "$PROC\aebcorrsv3.dta", clear
+*******************************************************
+* CONFIGURATION & CONSTANTS
+*******************************************************
+local SUF "_v3"
+local MIN_N 90
+local ALPHA 0.05
+local ROLL_WINDOW 24
+local BLANK_THRESH 0.3
+local N_COMPONENTS 3
+
+local DATA_MAIN "$PROC\aebcorrsv3.dta"
+local DATA_DIFF "$PROC\aebcorrsv3_diff.dta"
+local DATA_PCA  "$PROC\aebcorrsv3pca.dta"
+
+*******************************************************
+* HELPER PROGRAMS
+*******************************************************
+
+* Program: map_short_names
+* Maps long variable names to short display names
+capture program drop map_short_names
+program define map_short_names
+    syntax, var(string) [Return(string)]
+
+    local short "`var'"
+    local short : subinstr local short "News_Based_Policy_Uncert_Index" "EPU_news", all
+    local short : subinstr local short "CCI_monthly_cci"               "CCI",       all
+    local short : subinstr local short "UMCSENT_umc"                   "UMCSENT",   all
+    local short : subinstr local short "EOM_Close_de"                  "EOM",       all
+    local short : subinstr local short "GEPU_current_gepu"             "GEPU",      all
+    local short : subinstr local short "TPU_tpu"                       "TPU",       all
+    local short : subinstr local short "SBOI_nfibo"                    "SBOI",      all
+    local short : subinstr local short "UncertaintyIndex_nfibu"        "NFIBU",     all
+    local short : subinstr local short "SI_Dem_part"                   "SI_Dem",    all
+    local short : subinstr local short "SI_Ind_part"                   "SI_Ind",    all
+    local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
+    local short : subinstr local short "corn_vol_month"                "corn_mo",   all
+    local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
+    local short : subinstr local short "corn_close"                    "corn_px",   all
+    local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
+    local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
+    local short : subinstr local short "sb_close"                      "soy_px",    all
+    local short : subinstr local short "vix_vix"                       "VIX",       all
+    local short : subinstr local short "_cons"                         "Intercept", all
+    local short : subinstr local short "se_spring"                     "Spring",    all
+    local short : subinstr local short "se_summer"                     "Summer",    all
+    local short : subinstr local short "se_fall"                       "Fall",      all
+    local short : subinstr local short "se_winter"                     "Winter",    all
+
+    if "`return'" != "" {
+        c_local `return' "`short'"
+    }
+end
+
+* Program: export_matrix
+* Exports a Stata matrix to CSV with row names as first column
+capture program drop export_matrix
+program define export_matrix
+    syntax, matrix(string) file(string)
+
+    preserve
+        clear
+        svmat double `matrix', names(col)
+        gen variable = ""
+        local rn : rownames `matrix'
+        local i = 1
+        foreach r of local rn {
+            replace variable = "`r'" in `i'
+            local ++i
+        }
+        order variable
+        export delimited using "`file'", replace
+    restore
+end
+
+* Program: get_clean_varlist
+* Gets numeric variables excluding specified types
+capture program drop get_clean_varlist
+program define get_clean_varlist
+    syntax, Return(string) [EXclude(string) INClude(string) NOSeasons NOZ NOAEB]
+
+    * Start with all numeric or specified inclusion pattern
+    if "`include'" != "" {
+        ds `include', has(type numeric)
+    }
+    else {
+        ds, has(type numeric)
+    }
+    local varlist `r(varlist)'
+
+    * Always exclude mdate
+    local varlist : list varlist - mdate
+
+    * Exclude seasons if requested
+    if "`noseasons'" != "" {
+        ds se_*, has(type numeric)
+        if !_rc {
+            local seasons `r(varlist)'
+            local varlist : list varlist - seasons
+        }
+    }
+
+    * Exclude z_* variables if requested
+    if "`noz'" != "" {
+        capture unab zvars : z_*
+        if !_rc {
+            local varlist : list varlist - zvars
+        }
+    }
+
+    * Exclude AEB variants if requested
+    if "`noaeb'" != "" {
+        local aeb_vars "AEB_aeb AEB z_AEB_aeb z_AEB d_AEB_aeb d_AEB"
+        local varlist : list varlist - aeb_vars
+    }
+
+    * Apply custom exclusions
+    if "`exclude'" != "" {
+        local varlist : list varlist - exclude
+    }
+
+    c_local `return' "`varlist'"
+end
+
+* Program: build_aebcorrsv3pca
+* Helper: ensure an AEB-free snapshot exists for RAW PCA/FA routines
+capture program drop build_aebcorrsv3pca
+program define build_aebcorrsv3pca
+    syntax
+
+    preserve
+        quietly use "`DATA_MAIN'", clear
+
+        * Remove AEB-specific series and any standardized z_* remnants
+        capture drop AEB_aeb AEB z_*
+
+        compress
+        save "`DATA_PCA'", replace
+    restore
+end
+
+* Program: run_pca_fa
+* Parameterized PCA and Factor Analysis with rotation and export
+capture program drop run_pca_fa
+program define run_pca_fa
+    syntax varlist, suffix(string) [Ncomp(integer 3) BLanks(real 0.3) ///
+        EXportpca(string) EXportfa(string) NOScores]
+
+    local p : word count `varlist'
+    if `p' < 2 {
+        di as txt "Insufficient variables for PCA/FA (need at least 2)"
+        exit
+    }
+
+    * Determine number of components
+    local ncomp = cond(`p' >= `ncomp', `ncomp', `p')
+
+    quietly describe `varlist'
+    quietly summarize `varlist'
+    quietly corr `varlist'
+
+    **** PCA ****
+    pca `varlist'
+    screeplot, name(G_scree`suffix', replace)
+    screeplot, yline(1) name(G_scree`suffix'_y1, replace)
+    pca `varlist', mineigen(1)
+    pca `varlist', comp(`ncomp')
+    pca `varlist', comp(`ncomp') blanks(`blanks')
+    rotate, varimax
+    rotate, varimax blanks(`blanks')
+    rotate, clear
+    rotate, promax
+    rotate, promax blanks(`blanks')
+    rotate, clear
+
+    estat loadings
+    matrix L_pca`suffix' = e(L)
+
+    * Export PCA loadings if requested
+    if "`exportpca'" != "" {
+        export_matrix, matrix(L_pca`suffix') file("`exportpca'")
+    }
+
+    * Generate PCA scores if requested
+    if "`noscores'" == "" {
+        local pcs
+        forvalues i = 1/`ncomp' {
+            local pcs `pcs' pc`i'
+        }
+        capture drop `pcs'
+        predict `pcs', score
+        foreach v of local pcs {
+            rename `v' `v'`suffix'
+        }
+    }
+
+    estat kmo
+
+    **** FACTOR ANALYSIS ****
+    factor `varlist'
+    screeplot, name(G_scree`suffix'_fa, replace)
+    screeplot, yline(1) name(G_scree`suffix'_fa_y1, replace)
+    factor `varlist', mineigen(1)
+    factor `varlist', factor(`ncomp')
+    factor `varlist', factor(`ncomp') blanks(`blanks')
+    rotate, varimax
+    rotate, varimax blanks(`blanks')
+    rotate, clear
+    rotate, promax
+    rotate, promax blanks(`blanks')
+    rotate, clear
+
+    estat common
+    matrix L_fa`suffix' = e(L)
+
+    * Export FA loadings if requested
+    if "`exportfa'" != "" {
+        export_matrix, matrix(L_fa`suffix') file("`exportfa'")
+    }
+
+    * Generate FA scores if requested
+    if "`noscores'" == "" {
+        local fs
+        forvalues i = 1/`ncomp' {
+            local fs `fs' f`i'
+        }
+        capture drop `fs'
+        predict `fs'
+        foreach v of local fs {
+            rename `v' `v'`suffix'
+        }
+    }
+
+    * Reliability + Bartlett
+    alpha `varlist'
+    cap which factortest
+    if _rc ssc install factortest, replace
+    factortest `varlist'
+end
+
+* Program: horse_race_regression
+* Run one-at-a-time regressions for all predictors
+capture program drop horse_race_regression
+program define horse_race_regression
+    syntax varlist, Yvar(string) file(string) ///
+        [SEasons(string) MINn(integer 90) APpendseasons]
+
+    * Count predictors
+    local K : word count `varlist'
+    if `K' == 0 {
+        di as err "No predictors for horse race"
+        exit 111
+    }
+
+    * Setup postfile structure based on options
+    tempfile HR
+    tempname PF
+
+    if "`seasons'" != "" {
+        postfile `PF' str64 var str32 short double b se t p r2 N str1 star ///
+            double const_b double const_se double p_seasons using "`HR'", replace
+    }
+    else {
+        postfile `PF' str64 var str32 short double b se t p r2 N str1 star ///
+            double const_b double const_se using "`HR'", replace
+    }
+
+    * Run regressions for each predictor
+    forvalues j = 1/`K' {
+        local v : word `j' of `varlist'
+        quietly regress `yvar' `v' `seasons', vce(robust)
+        if _rc | missing(e(N)) continue
+        if (e(N) < `minn') continue
+
+        scalar b   = _b[`v']
+        scalar se  = _se[`v']
+        scalar t   = b/se
+        scalar p   = 2*ttail(e(df_r), abs(t))
+        scalar r2  = e(r2)
+        scalar NN  = e(N)
+        scalar b0  = .
+        capture scalar b0 = _b[_cons]
+        scalar se0 = .
+        capture scalar se0 = _se[_cons]
+
+        * Test seasons if present
+        scalar pS = .
+        if "`seasons'" != "" {
+            quietly testparm `seasons'
+            scalar pS = r(p)
+        }
+
+        * Get short name
+        map_short_names, var("`v'") return(short)
+
+        local star ""
+        if (p < `ALPHA') local star "*"
+
+        if "`seasons'" != "" {
+            post `PF' ("`v'") ("`short'") (b) (se) (t) (p) (r2) (NN) ("`star'") (b0) (se0) (pS)
+        }
+        else {
+            post `PF' ("`v'") ("`short'") (b) (se) (t) (p) (r2) (NN) ("`star'") (b0) (se0)
+        }
+    }
+
+    * Append season dummies as separate rows if requested
+    if "`appendseasons'" != "" & "`seasons'" != "" {
+        quietly regress `yvar' `seasons', vce(robust)
+        if !_rc & e(N) >= `minn' {
+            scalar r2s  = e(r2)
+            scalar NNs  = e(N)
+            scalar b0s  = .
+            capture scalar b0s = _b[_cons]
+            scalar se0s = .
+            capture scalar se0s = _se[_cons]
+
+            foreach s of local seasons {
+                map_short_names, var("`s'") return(sh)
+
+                capture scalar bs  = _b[`s']
+                capture scalar ses = _se[`s']
+                if _rc continue
+                scalar ts = bs/ses
+                scalar ps = 2*ttail(e(df_r), abs(ts))
+
+                local star ""
+                if (ps < `ALPHA') local star "*"
+
+                if "`seasons'" != "" {
+                    post `PF' ("`s'") ("`sh'") (bs) (ses) (ts) (ps) (r2s) (NNs) ("`star'") (b0s) (se0s) (.)
+                }
+                else {
+                    post `PF' ("`s'") ("`sh'") (bs) (ses) (ts) (ps) (r2s) (NNs) ("`star'") (b0s) (se0s)
+                }
+            }
+        }
+    }
+
+    postclose `PF'
+
+    * Format and export results
+    use "`HR'", clear
+    if "`seasons'" != "" {
+        order var short b se t p star r2 N const_b const_se p_seasons
+    }
+    else {
+        order var short b se t p star r2 N const_b const_se
+    }
+    format b se const_b const_se %9.3g
+    format t %8.2f
+    format p %6.4f
+    format r2 %6.4f
+    format N %9.0f
+    if "`seasons'" != "" {
+        format p_seasons %6.4f
+    }
+
+    export delimited using "`file'", replace
+end
+
+*******************************************************
+* SECTION 0: Load and set time
+*******************************************************
+use "`DATA_MAIN'", clear
 capture confirm variable mdate
 if _rc {
     di as err "mdate missing"
@@ -16,98 +380,66 @@ if _rc {
 format mdate %tm
 tsset mdate, monthly
 
-* Suffix for all outputs in this run
-local SUF "_v3"
-
-* Ensure AEB_aeb exists (only AEB series in this dataset)
+* Ensure AEB_aeb exists
 capture confirm variable AEB_aeb
 if _rc {
     di as err "AEB_aeb not found in the dataset."
     exit 111
 }
 
-* Pre-OLS safeguards: drop any lingering standardized AEB so it cannot be reused
+* Pre-OLS safeguards: drop any lingering standardized AEB
 capture drop z_AEB_aeb
 
-* Helper: ensure an AEB-free snapshot exists for RAW PCA/FA routines
-capture program drop build_aebcorrsv3pca
-program define build_aebcorrsv3pca
-    syntax
-
-    preserve
-        quietly use "$PROC\aebcorrsv3.dta", clear
-
-        * Remove AEB-specific series and any standardized z_* remnants
-        capture drop AEB_aeb
-        capture drop AEB
-        capture drop z_*
-
-        compress
-        save "$PROC\aebcorrsv3pca.dta", replace
-    restore
-end
-
+* Build AEB-free snapshot for PCA/FA
 quietly build_aebcorrsv3pca
 
-* Identify numeric vars; exclude mdate and SEASON dummies (no Fourier terms exist)
-ds, has(type numeric)
-local allnum `r(varlist)'
-local allnum : list allnum - mdate
-ds se_*, has(type numeric)
-local seasons `r(varlist)'
+*******************************************************
+* SECTION 1: Z-score all numeric vars (exclude mdate, seasons, AEB_aeb)
+*******************************************************
+get_clean_varlist, return(zbase) noseasons noaeb
+foreach v of local zbase {
+    capture drop z_`v'
+    quietly egen z_`v' = std(`v')
+}
 
-* Keep a "no-season" numeric set for transforms/analyses
-local nums_noseason : list allnum - seasons
-
-* Snapshot without AEB_aeb for PCA/FA work (used later in section 5)
+* Snapshot without AEB_aeb for PCA/FA work
 tempfile aebcorrsv3pca
 preserve
     drop AEB_aeb
     save `aebcorrsv3pca'
 restore
+
 *******************************************************
-* 1) Z-score all numeric vars (exclude mdate, seasons)
+* SECTION 2: Correlations
 *******************************************************
-local zbase `nums_noseason'
-foreach v of local zbase {
-    if "`v'" == "AEB_aeb" continue
-    capture drop z_`v'
-    quietly egen z_`v' = std(`v')
-}
 
-
-
-**************************************************************
-* 2) Correlations — include seasons + export full matrix
-**************************************************************
-* Build clean lists
+* Get variable lists
+get_clean_varlist, return(nums_noseason) noseasons
 ds se_*, has(type numeric)
 local seasons `r(varlist)'
 
-* Non-season numerics (used for z_ counterparts in pairwise)
+* Build safe list (only vars with z_ counterparts)
 local others `nums_noseason'
-local others : list others - mdate
 local others : list others - AEB_aeb
-
-* Keep only vars that actually have z_ counterparts
 local safe_others
 foreach v of local others {
     capture confirm variable z_`v'
     if !_rc local safe_others `safe_others' `v'
 }
 
-* ------------ 2A) Pairwise correlations ------------
+* 2A) Pairwise correlations
 preserve
     tempfile out
     tempname ph
     postfile `ph' str64 var double rho int N using "`out'", replace
-    * Non-season variables — correlate nominal series (no z_)
+
+    * Non-season variables
     foreach v of local safe_others {
         quietly corr AEB_aeb `v'
         post `ph' ("`v'") (r(rho)) (r(N))
     }
 
-    * Season dummies (still pair with nominal AEB_aeb)
+    * Season dummies
     if "`seasons'" != "" {
         foreach s of local seasons {
             quietly corr AEB_aeb `s'
@@ -127,18 +459,15 @@ preserve
     else {
         gen double abs_rho = abs(rho)
         gsort -abs_rho
-
         order var rho N
         format rho %6.3f
-        format N   %9.0f
-
+        format N %9.0f
         export delimited using "$TAB\T_corr_pairwise`SUF'.csv", replace
         drop abs_rho
     }
 restore
 
-* ------------ 2B) Full correlation matrix (incl. seasons) ------------
-* Build matrix varlist without AEB_aeb (per pre-OLS exclusion)
+* 2B) Full correlation matrix (incl. seasons)
 local tmp `nums_noseason'
 local tmp : list tmp - AEB_aeb
 local CMAT "`tmp' `seasons'"
@@ -150,73 +479,54 @@ else {
     quietly corr `CMAT'
     matrix C = r(C)
 
-* --- Make column names legal, <=32 chars, and UNIQUE to satisfy svmat
-local cols : colnames C
-local safe ""
-local used ""
-local i = 0
-foreach c of local cols {
-    local ++i
-    local base = strtoname("`c'")
-    if strlen("`base'")>28 local base = substr("`base'",1,28)
-    local nm "`base'"
-    local k = 1
-    while strpos(" `used' "," `nm' ") {
-        local suffix _`k'
-        local slen : length local suffix
-        local blen = 32 - `slen'
-        if `blen' < 1 local blen = 1
-        local nm = substr("`base'",1,`blen')
-        local nm "`nm'`suffix'"
-        local ++k
-    }
-    local used `used' `nm'
-    local safe `safe' `nm'
-}
-matrix colnames C = `safe'
-
-preserve
-    clear
-    svmat double C, names(col)
-    gen variable = ""
-    local rn : rownames C
-    local i = 1
-    foreach r of local rn {
-        replace variable = "`r'" in `i'
+    * Make column names legal, <=32 chars, and UNIQUE
+    local cols : colnames C
+    local safe ""
+    local used ""
+    local i = 0
+    foreach c of local cols {
         local ++i
+        local base = strtoname("`c'")
+        if strlen("`base'")>28 local base = substr("`base'",1,28)
+        local nm "`base'"
+        local k = 1
+        while strpos(" `used' "," `nm' ") {
+            local suffix _`k'
+            local slen : length local suffix
+            local blen = 32 - `slen'
+            if `blen' < 1 local blen = 1
+            local nm = substr("`base'",1,`blen')
+            local nm "`nm'`suffix'"
+            local ++k
+        }
+        local used `used' `nm'
+        local safe `safe' `nm'
     }
-    order variable
-    export delimited using "$TAB\T_corr_full`SUF'.csv", replace
-restore
+    matrix colnames C = `safe'
+
+    export_matrix, matrix(C) file("$TAB\T_corr_full`SUF'.csv")
 }
 
-*****************************************************************
-* 3) (Optional) Rolling 24-month correlations (exclude seasons)
-*****************************************************************
+*******************************************************
+* SECTION 3: Rolling 24-month correlations (exclude seasons)
+*******************************************************
 cap which rangestat
 if _rc ssc install rangestat, replace
 
 preserve
-    use "$PROC\aebcorrsv3.dta", clear
+    use "`DATA_MAIN'", clear
     tsset mdate, monthly
 
-    ds, has(type numeric)
-    local allnum `r(varlist)'
-    local allnum : list allnum - mdate
-    ds se_*, has(type numeric)
-    local seasons `r(varlist)'
-    local nums_noseason : list allnum - seasons
+    get_clean_varlist, return(nums_noseason) noseasons
 
     * Rebuild z_ for these only
-    local zbase `nums_noseason'
-    foreach v of local zbase {
+    foreach v of local nums_noseason {
         capture drop z_`v'
         quietly egen z_`v' = std(`v')
     }
 
-    * Rolling targets: no mdate/AEB_aeb; must have z_ partner
+    * Rolling targets: must have z_ partner, exclude mdate and AEB_aeb
     local others `nums_noseason'
-    local others : list others - mdate
     local others : list others - AEB_aeb
 
     local safe_others
@@ -227,12 +537,12 @@ preserve
         }
     }
 
-    * ---- Rolling correlations
+    * Rolling correlations
     foreach v of local safe_others {
         tempvar prod mx my mxy sx sy
         gen double `prod' = z_AEB_aeb * z_`v'
         rangestat (mean) `mx'=z_AEB_aeb `my'=z_`v' `mxy'=`prod' ///
-                  (sd)   `sx'=z_AEB_aeb `sy'=z_`v', interval(mdate -23 0)
+                  (sd)   `sx'=z_AEB_aeb `sy'=z_`v', interval(mdate -`ROLL_WINDOW'+1 0)
 
         local base = strtoname("`v'")
         local maxbase = 32 - `=strlen("r_AEB_aeb_")'
@@ -259,9 +569,9 @@ preserve
     save "$PROC\monthly_rollingcorrs_simple`SUF'.dta", replace
 restore
 
-**************************************************************
-* 4) (Optional) Quick chart for one rolling series
-**************************************************************
+*******************************************************
+* SECTION 4: Quick chart for one rolling series
+*******************************************************
 use "$PROC\monthly_rollingcorrs_simple`SUF'.dta", clear
 local target r_AEB_aeb_News_Based_Policy_Uncert_Index
 capture confirm variable `target'
@@ -274,7 +584,7 @@ if _rc {
 capture confirm variable `target'
 if !_rc {
     twoway tsline `target', ///
-        title("Rolling 24m corr: AEB_aeb vs selected") ytitle("corr") xtitle("")
+        title("Rolling `ROLL_WINDOW'm corr: AEB_aeb vs selected") ytitle("corr") xtitle("")
     graph export "$FIG\F3_roll_AEBaeb_selected`SUF'.png", replace width(1600)
 }
 capture unab rvars : r_*
@@ -282,155 +592,38 @@ if !_rc {
     drop `rvars'
 }
 
+*******************************************************
+* SECTION 5: PCA + FA
+*******************************************************
 
-**************************************************************
-* 5) PCA + FA — auto-build varlists (include corn/sb vols)
-**************************************************************
-* Build RAW = all numeric except mdate, seasons, z_* and AEB_aeb
-ds, has(type numeric)
-local Xraw `r(varlist)'
-local Xraw : list Xraw - mdate
-local Xraw : list Xraw - seasons
-local Xraw : list Xraw - AEB_aeb
-capture unab zvars : z_*
-if !_rc {
-    local Xraw : list Xraw - zvars
-}
-
-* Build Z = all z_* constructed above
+* Get variable lists
+get_clean_varlist, return(Xraw) noseasons noz noaeb
 capture unab Z : z_*
 if _rc local Z ""
 local Z : list Z - z_AEB_aeb
 
 local p_z : word count `Z'
-local ncomp_z = cond(`p_z' >= 3, 3, `p_z')
-local p_snap = 0
+local ncomp_z = cond(`p_z' >= `N_COMPONENTS', `N_COMPONENTS', `p_z')
 
-*******************************************************
-* A) RAW (nominal) variables
-*******************************************************
+**** 5A) RAW (nominal) variables ****
 preserve
-    use "$PROC\aebcorrsv3pca.dta", clear
+    use "`DATA_PCA'", clear
 
-    * Build raw list directly from the snapshot
-    ds, has(type numeric)
-    local Xsnap `r(varlist)'
-    local Xsnap : list Xsnap - mdate
-
-    ds se_*, has(type numeric)
-    local seasons_snap `r(varlist)'
-    local Xsnap : list Xsnap - seasons_snap
-
-    capture unab drop_z : z_*
-    if !_rc local Xsnap : list Xsnap - drop_z
-
-    local Xsnap : list Xsnap - AEB_aeb
-    local Xsnap : list Xsnap - AEB
-    local Xsnap : list retoken Xsnap
+    * Build raw list from snapshot
+    get_clean_varlist, return(Xsnap) noseasons noz noaeb
 
     local p_snap : word count `Xsnap'
     if `p_snap' < 2 {
         di as txt "No variables available for RAW PCA/FA snapshot once exclusions applied."
     }
     else {
-        local ncomp_snap = cond(`p_snap' >= 3, 3, `p_snap')
+        local ncomp_snap = cond(`p_snap' >= `N_COMPONENTS', `N_COMPONENTS', `p_snap')
 
-        quietly describe `Xsnap'
-        quietly summarize `Xsnap'
-        quietly corr `Xsnap'
+        run_pca_fa `Xsnap', suffix(_raw) ncomp(`ncomp_snap') blanks(`BLANK_THRESH') ///
+            exportpca("$TAB\T_loadings_pca_raw_varimax`SUF'.csv") ///
+            exportfa("$TAB\T_loadings_fa_raw_varimax`SUF'.csv")
 
-        * PCA (RAW) on snapshot vars
-        pca `Xsnap'
-        screeplot, name(G_scree_raw, replace)
-        screeplot, yline(1) name(G_scree_raw_y1, replace)
-        pca `Xsnap', mineigen(1)
-        pca `Xsnap', comp(`ncomp_snap')
-        pca `Xsnap', comp(`ncomp_snap') blanks(.3)
-        rotate, varimax
-        rotate, varimax blanks(.3)
-        rotate, clear
-        rotate, promax
-        rotate, promax blanks(.3)
-        rotate, clear
-
-        estat loadings
-        matrix L_pca_raw = e(L)
-        
-            clear
-            svmat double L_pca_raw, names(col)
-            gen variable = ""
-            local rn : rownames L_pca_raw
-            local i = 1
-            foreach r of local rn {
-                replace variable = "`r'" in `i'
-                local ++i
-            }
-            order variable
-            export delimited using "$TAB\T_loadings_pca_raw_varimax`SUF'.csv", replace
-        restore
-
-        * PCA scores -> *_raw
-        local pcs_raw
-        forvalues i = 1/`ncomp_snap' {
-            local pcs_raw `pcs_raw' pc`i'
-        }
-        capture drop `pcs_raw'
-        predict `pcs_raw', score
-        foreach v of local pcs_raw {
-            rename `v' `v'_raw
-        }
-
-        * KMO
-        estat kmo
-
-        * FACTOR (RAW)
-        factor `Xsnap'
-        screeplot, name(G_scree_raw_fa, replace)
-        screeplot, yline(1) name(G_scree_raw_fa_y1, replace)
-        factor `Xsnap', mineigen(1)
-        factor `Xsnap', factor(`ncomp_snap')
-        factor `Xsnap', factor(`ncomp_snap') blanks(0.3)
-        rotate, varimax
-        rotate, varimax blanks(.3)
-        rotate, clear
-        rotate, promax
-        rotate, promax blanks(.3)
-        rotate, clear
-
-        estat common
-        matrix L_fa_raw = e(L)
-        preserve
-            clear
-            svmat double L_fa_raw, names(col)
-            gen variable = ""
-            local rn : rownames L_fa_raw
-            local i = 1
-            foreach r of local rn {
-                replace variable = "`r'" in `i'
-                local ++i
-            }
-            order variable
-            export delimited using "$TAB\T_loadings_fa_raw_varimax`SUF'.csv", replace
-        restore
-
-        * FA scores -> *_raw
-        local fs_raw
-        forvalues i = 1/`ncomp_snap' {
-            local fs_raw `fs_raw' f`i'
-        }
-        capture drop `fs_raw'
-        predict `fs_raw'
-        foreach v of local fs_raw {
-            rename `v' `v'_raw
-        }
-
-        * Reliability + Bartlett (RAW)
-        alpha `Xsnap'
-        cap which factortest
-        if _rc ssc install factortest, replace
-        factortest `Xsnap'
-
-        * Save raw PCA/FA scores from the snapshot
+        * Save raw PCA/FA scores
         local have_raw ""
         capture unab have_raw : pc*_raw f*_raw
         if !_rc {
@@ -442,275 +635,99 @@ preserve
             di as result "✅ Saved: $PROC\fa_pca_scores_raw`SUF'.dta"
         }
     }
+restore
 
 if (`p_snap' < 2 & `p_z' < 2) {
     di as err "Not enough variables for PCA/FA."
     exit 111
 }
 
-*******************************************************
-* B) STANDARDIZED (z_) variables
-*******************************************************
+**** 5B) STANDARDIZED (z_) variables ****
 if `p_z' >= 2 {
-    quietly describe `Z'
-    quietly summarize `Z'
-    quietly corr `Z'
+    run_pca_fa `Z', suffix(_z) ncomp(`ncomp_z') blanks(`BLANK_THRESH') ///
+        exportpca("$TAB\T_loadings_pca_z_varimax`SUF'.csv") ///
+        exportfa("$TAB\T_loadings_fa_z_varimax`SUF'.csv")
 
-    * PCA (Z)
-    pca `Z'
-    screeplot, name(G_scree_z, replace)
-    screeplot, yline(1) name(G_scree_z_y1, replace)
-    pca `Z', mineigen(1)
-    pca `Z', comp(`ncomp_z')
-    pca `Z', comp(`ncomp_z') blanks(.3)
-    rotate, varimax
-
-    estat loadings
-    matrix L_pca_z = e(L)
-    preserve
-        clear
-        svmat double L_pca_z, names(col)
-        gen variable = ""
-        local rn : rownames L_pca_z
-        local i = 1
-        foreach r of local rn {
-            replace variable = "`r'" in `i'
-            local ++i
-        }
-        order variable
-        export delimited using "$TAB\T_loadings_pca_z_varimax`SUF'.csv", replace
-    restore
-
-    * PCA scores -> *_z
-    local pcs_z
-    forvalues i = 1/`ncomp_z' {
-        local pcs_z `pcs_z' pc`i'
+    * Save z scores
+    local have_z ""
+    capture unab have_z : pc*_z f*_z
+    if !_rc {
+        preserve
+            keep mdate `have_z'
+            compress
+            save "$PROC\fa_pca_scores_z`SUF'.dta", replace
+        restore
     }
-    capture drop `pcs_z'
-    predict `pcs_z', score
-    foreach v of local pcs_z {
-        rename `v' `v'_z
-    }
-
-    * KMO
-    estat kmo
-
-    * FACTOR (Z)
-    factor `Z'
-    screeplot, name(G_scree_z_fa, replace)
-    screeplot, yline(1) name(G_scree_z_fa_y1, replace)
-    factor `Z', mineigen(1)
-    factor `Z', factor(`ncomp_z')
-    factor `Z', factor(`ncomp_z') blanks(0.3)
-    rotate, varimax
-
-    estat common
-    matrix L_fa_z = e(L)
-    preserve
-        clear
-        svmat double L_fa_z, names(col)
-        gen variable = ""
-        local rn : rownames L_fa_z
-        local i = 1
-        foreach r of local rn {
-            replace variable = "`r'" in `i'
-            local ++i
-        }
-        order variable
-        export delimited using "$TAB\T_loadings_fa_z_varimax`SUF'.csv", replace
-    restore
-
-    * FA scores -> *_z
-    local fs_z
-    forvalues i = 1/`ncomp_z' {
-        local fs_z `fs_z' f`i'
-    }
-    capture drop `fs_z'
-    predict `fs_z'
-    foreach v of local fs_z {
-        rename `v' `v'_z
-    }
-
-    * Reliability + Bartlett (Z)
-    alpha `Z'
-    cap which factortest
-    if _rc ssc install factortest, replace
-    factortest `Z'
 }
 
-**************************************************************
-* C) Save tidy score files — robust to missing scores
-**************************************************************
-* RAW scores
-local have_raw ""
-capture unab have_raw : pc*_raw f*_raw
-if !_rc {
-    preserve
-        keep mdate `have_raw'
-        compress
-        save "$PROC\fa_pca_scores_raw`SUF'.dta", replace
-    restore
-}
-
-* Z scores
-local have_z ""
-capture unab have_z : pc*_z f*_z
-if !_rc {
-    preserve
-        keep mdate `have_z'
-        compress
-        save "$PROC\fa_pca_scores_z`SUF'.dta", replace
-    restore
-}
-
-**************************************************************
-* D) PCA + FA WITHOUT corn_close and sb_close (nopxs)
-**************************************************************
+**** 5D) PCA + FA WITHOUT corn_close and sb_close (nopxs) ****
 preserve
-    * Load the aebcorrsv3pca dataset
-    use "$PROC\aebcorrsv3pca.dta", clear
+    use "`DATA_PCA'", clear
+    drop corn_close sb_close mdate se_spring se_summer se_fall se_winter
 
-    * Drop corn_close and sb_close
-    drop corn_close sb_close
-
-    * Drop mdate and season dummies for analysis
-    drop mdate se_spring se_summer se_fall se_winter
-
-    * Get list of remaining variables for PCA/FA
     ds
     local varlist_nopxs `r(varlist)'
 
     di as result "=== PCA/FA without corn_close and sb_close ==="
     di as result "Variables included: `varlist_nopxs'"
 
-    * Save current data to tempfile for reloading after exports
     tempfile nopxs_data
     save `nopxs_data', replace
 
-    * Run PCA using Kaiser criterion (eigenvalue > 1)
+    * Run PCA
     pca `varlist_nopxs', mineigen(1)
-    rotate, varimax blanks(.3)
-
-    * Export PCA loadings
+    rotate, varimax blanks(`BLANK_THRESH')
     estat loadings
     matrix L_pca_nopxs = e(L)
-
-    clear
-    svmat double L_pca_nopxs, names(col)
-    gen variable = ""
-    local rn : rownames L_pca_nopxs
-    local i = 1
-    foreach r of local rn {
-        replace variable = "`r'" in `i'
-        local ++i
-    }
-    order variable
-    export delimited using "$TAB\T_loadings_pca_nopxs`SUF'.csv", replace
+    export_matrix, matrix(L_pca_nopxs) file("$TAB\T_loadings_pca_nopxs`SUF'.csv")
     di as result "Saved: $TAB\T_loadings_pca_nopxs`SUF'.csv"
 
-    * Reload data for FA
+    * Reload for FA
     use `nopxs_data', clear
-
-    * Run Factor Analysis using Kaiser criterion (eigenvalue > 1)
     factor `varlist_nopxs', mineigen(1)
-    rotate, varimax blanks(.3)
-
-    * Export FA loadings
+    rotate, varimax blanks(`BLANK_THRESH')
     estat common
     matrix L_fa_nopxs = e(L)
-
-    clear
-    svmat double L_fa_nopxs, names(col)
-    gen variable = ""
-    local rn : rownames L_fa_nopxs
-    local i = 1
-    foreach r of local rn {
-        replace variable = "`r'" in `i'
-        local ++i
-    }
-    order variable
-    export delimited using "$TAB\T_loadings_fa_nopxs`SUF'.csv", replace
+    export_matrix, matrix(L_fa_nopxs) file("$TAB\T_loadings_fa_nopxs`SUF'.csv")
     di as result "Saved: $TAB\T_loadings_fa_nopxs`SUF'.csv"
-
 restore
 
-**************************************************************
-* E) PCA + FA for Z-SCORED variables WITHOUT corn/soy prices (z_nopxs)
-**************************************************************
+**** 5E) PCA + FA for Z-SCORED variables WITHOUT corn/soy prices (z_nopxs) ****
 preserve
-    * Load the main dataset with z-scored variables
-    use "$PROC\aebcorrsv3.dta", clear
-
-    * Keep only z_* variables
+    use "`DATA_MAIN'", clear
     keep mdate z_*
+    drop z_AEB_aeb z_corn_close z_sb_close mdate
 
-    * Drop z_AEB_aeb, z_corn_close, and z_sb_close
-    drop z_AEB_aeb z_corn_close z_sb_close
-
-    * Drop mdate for analysis
-    drop mdate
-
-    * Get list of remaining z-scored variables for PCA/FA
     ds
     local varlist_z_nopxs `r(varlist)'
 
     di as result "=== PCA/FA for z-scored variables without corn/soy prices ==="
     di as result "Variables included: `varlist_z_nopxs'"
 
-    * Save current data to tempfile for reloading after exports
     tempfile z_nopxs_data
     save `z_nopxs_data', replace
 
-    * Run PCA using Kaiser criterion (eigenvalue > 1)
+    * Run PCA
     pca `varlist_z_nopxs', mineigen(1)
-    rotate, varimax blanks(.3)
-
-    * Export PCA loadings
+    rotate, varimax blanks(`BLANK_THRESH')
     estat loadings
     matrix L_pca_z_nopxs = e(L)
-
-    clear
-    svmat double L_pca_z_nopxs, names(col)
-    gen variable = ""
-    local rn : rownames L_pca_z_nopxs
-    local i = 1
-    foreach r of local rn {
-        replace variable = "`r'" in `i'
-        local ++i
-    }
-    order variable
-    export delimited using "$TAB\T_loadings_pca_z_nopxs`SUF'.csv", replace
+    export_matrix, matrix(L_pca_z_nopxs) file("$TAB\T_loadings_pca_z_nopxs`SUF'.csv")
     di as result "Saved: $TAB\T_loadings_pca_z_nopxs`SUF'.csv"
 
-    * Reload data for FA
+    * Reload for FA
     use `z_nopxs_data', clear
-
-    * Run Factor Analysis using Kaiser criterion (eigenvalue > 1)
     factor `varlist_z_nopxs', mineigen(1)
-    rotate, varimax blanks(.3)
-
-    * Export FA loadings
+    rotate, varimax blanks(`BLANK_THRESH')
     estat common
     matrix L_fa_z_nopxs = e(L)
-
-    clear
-    svmat double L_fa_z_nopxs, names(col)
-    gen variable = ""
-    local rn : rownames L_fa_z_nopxs
-    local i = 1
-    foreach r of local rn {
-        replace variable = "`r'" in `i'
-        local ++i
-    }
-    order variable
-    export delimited using "$TAB\T_loadings_fa_z_nopxs`SUF'.csv", replace
+    export_matrix, matrix(L_fa_z_nopxs) file("$TAB\T_loadings_fa_z_nopxs`SUF'.csv")
     di as result "Saved: $TAB\T_loadings_fa_z_nopxs`SUF'.csv"
-
 restore
 
-**************************************************************
-* 6) Single–Factor "AEB-like" index (RAW and Z)
-**************************************************************
+*******************************************************
+* SECTION 6: Single–Factor "AEB-like" index (RAW and Z)
+*******************************************************
 local p_raw : word count `Xraw'
 local p_z   : word count `Z'
 
@@ -718,19 +735,7 @@ local p_z   : word count `Z'
 if `p_raw' >= 2 {
     factor `Xraw', factor(1)
     matrix L_fa1_raw = e(L)
-    preserve
-        clear
-        svmat double L_fa1_raw, names(col)
-        gen variable = ""
-        local rn : rownames L_fa1_raw
-        local i = 1
-        foreach r of local rn {
-            replace variable = "`r'" in `i'
-            local ++i
-        }
-        order variable
-        export delimited using "$TAB\T_loadings_fa1_raw`SUF'.csv", replace
-    restore
+    export_matrix, matrix(L_fa1_raw) file("$TAB\T_loadings_fa1_raw`SUF'.csv")
 
     capture drop F1_raw
     predict F1_raw
@@ -747,19 +752,7 @@ if `p_raw' >= 2 {
 if `p_z' >= 2 {
     factor `Z', factor(1)
     matrix L_fa1_z = e(L)
-    preserve
-        clear
-        svmat double L_fa1_z, names(col)
-        gen variable = ""
-        local rn : rownames L_fa1_z
-        local i = 1
-        foreach r of local rn {
-            replace variable = "`r'" in `i'
-            local ++i
-        }
-        order variable
-        export delimited using "$TAB\T_loadings_fa1_z`SUF'.csv", replace
-    restore
+    export_matrix, matrix(L_fa1_z) file("$TAB\T_loadings_fa1_z`SUF'.csv")
 
     capture drop F1_z
     predict F1_z
@@ -784,13 +777,13 @@ foreach which in raw z {
 }
 
 *******************************************************
-* 6) OLS: ΔAEB ~ all other first-difference vars (d_*) + seasons
+* SECTION 7: OLS - Kitchen Sink with Seasons
 *******************************************************
-use "$PROC\aebcorrsv3_diff.dta", clear
+use "`DATA_DIFF'", clear
 format mdate %tm
 tsset mdate, monthly
 
-* Dependent variable (prefer d_AEB_aeb; fallback d_AEB)
+* Dependent variable
 local y ""
 capture confirm variable d_AEB_aeb
 if !_rc local y d_AEB_aeb
@@ -819,13 +812,13 @@ foreach v of local cand {
     }
 }
 
-* Add seasonal dummies as controls (omit se_winter to avoid dummy trap)
+* Add seasonal dummies as controls (omit se_winter)
 ds se_*, has(type numeric)
 local SE `r(varlist)'
 local SE_nobase `SE'
 local SE_nobase : list SE_nobase - se_winter
 
-* Safety: ensure predictors remain
+* Safety check
 local p : word count `X'
 if `p'==0 & "`SE_nobase'"=="" {
     di as err "No predictors left after exclusions."
@@ -838,7 +831,7 @@ regress `y' `X' `SE_nobase', vce(robust)
 * Multicollinearity check
 estat vif
 
-* ---- Quick print line + seasons joint test ----
+* Quick summary
 di as res "Kitchen-sink OLS  |  N=" %9.0f e(N) "  R2=" %6.4f e(r2) ///
           "  adjR2=" %6.4f e(r2_a) "  RMSE=" %9.3g e(rmse)
 if "`SE_nobase'" != "" {
@@ -846,18 +839,16 @@ if "`SE_nobase'" != "" {
     di as res "Seasons joint p = " %6.4f r(p)
 }
 
-* ---- Export tidy coefficient table WITH model stats: $TAB\kitchen_sink.csv ----
+* Export coefficient table
 tempfile KS
 tempname PF
 
-* Capture model-level stats once
 scalar R2    = e(r2)
 scalar AR2   = e(r2_a)
 scalar NN    = e(N)
 scalar RMSE  = e(rmse)
 scalar P_SES = .
-capture confirm local SE_nobase
-if !_rc & "`SE_nobase'" != "" {
+if "`SE_nobase'" != "" {
     quietly testparm `SE_nobase'
     scalar P_SES = r(p)
 }
@@ -874,33 +865,9 @@ foreach v of local cn {
     scalar tt = bb/ss
     scalar pp = 2*ttail(e(df_r), abs(tt))
     local star ""
-    if (pp < .05) local star "*"
+    if (pp < `ALPHA') local star "*"
 
-    * Short name mapping (same scheme as horse-race)
-    local short "`v'"
-    local short : subinstr local short "News_Based_Policy_Uncert_Index" "EPU_news", all
-    local short : subinstr local short "CCI_monthly_cci"               "CCI",       all
-    local short : subinstr local short "UMCSENT_umc"                   "UMCSENT",   all
-    local short : subinstr local short "EOM_Close_de"                  "EOM",       all
-    local short : subinstr local short "GEPU_current_gepu"             "GEPU",      all
-    local short : subinstr local short "TPU_tpu"                       "TPU",       all
-    local short : subinstr local short "SBOI_nfibo"                    "SBOI",      all
-    local short : subinstr local short "UncertaintyIndex_nfibu"        "NFIBU",     all
-    local short : subinstr local short "SI_Dem_part"                   "SI_Dem",    all
-    local short : subinstr local short "SI_Ind_part"                   "SI_Ind",    all
-    local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
-    local short : subinstr local short "corn_vol_month"                "corn_mo",   all
-    local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
-	local short : subinstr local short "corn_close"               "corn_px",   all
-    local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
-    local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
-	  local short : subinstr local short "sb_close"                      "soy_px",    all
-    local short : subinstr local short "vix_vix"                       "VIX",       all
-    local short : subinstr local short "_cons"                         "Intercept", all
-    local short : subinstr local short "se_spring"                     "Spring",    all
-    local short : subinstr local short "se_summer"                     "Summer",    all
-    local short : subinstr local short "se_fall"                       "Fall",      all
-    local short : subinstr local short "se_winter"                     "Winter",    all
+    map_short_names, var("`v'") return(short)
 
     post `PF' ("`v'") ("`short'") (bb) (ss) (tt) (pp) ("`star'") ///
         (R2) (AR2) (NN) (RMSE) (P_SES)
@@ -915,22 +882,18 @@ format p p_seasons %6.4f
 format r2 adjr2 %6.4f
 format N %9.0f
 format rmse %9.3g
-
 export delimited using "$TAB\kitchen_sink.csv", replace
 
-
-
 *******************************************************
-* 6b) HORSE RACE — ΔAEB on each X one-at-a-time
-*     (no seasons, N>=90, original order, star p<.05)
+* SECTION 8: Horse Races
 *******************************************************
 
-* Load differenced data (consistent with later horse-race steps)
-use "$PROC\aebcorrsv3_diff.dta", clear
+* Load differenced data
+use "`DATA_DIFF'", clear
 format mdate %tm
 tsset mdate, monthly
 
-* DV (prefer d_AEB_aeb; fallback d_AEB)
+* Dependent variable
 local y ""
 capture confirm variable d_AEB_aeb
 if !_rc local y d_AEB_aeb
@@ -940,92 +903,20 @@ else {
 }
 if "`y'"=="" exit 111
 
-* Build X list in DATASET ORDER: all d_* minus DV and d_mdate
+* Build predictor list
 ds d_*, has(type numeric)
 local X `r(varlist)'
 local X : list X - `y'
 local X : list X - d_AEB_aeb
 local X : list X - d_AEB
 local X : list X - d_mdate
-local K : word count `X'
-if `K'==0 exit 111
 
-* Collect results
-tempfile HR
-tempname PF
-postfile `PF' str64 var str32 short double b se t p r2 N str1 star ///
-    double const_b double const_se using "`HR'", replace
-
-
-forvalues j = 1/`K' {
-    local v : word `j' of `X'
-    quietly regress `y' `v', vce(robust)
-    if _rc | missing(e(N)) continue
-    if (e(N) < 90) continue
-
-    scalar b  = _b[`v']
-    scalar se = _se[`v']
-    scalar t  = b/se
-    scalar p  = 2*ttail(e(df_r), abs(t))
-    scalar r2 = e(r2)
-    scalar NN = e(N)
-	scalar b0  = _b[_cons]
-	scalar se0 = _se[_cons]
-
-    * Short names
-    local short "`v'"
-    local short : subinstr local short "News_Based_Policy_Uncert_Index" "EPU_news", all
-    local short : subinstr local short "CCI_monthly_cci"               "CCI",       all
-    local short : subinstr local short "UMCSENT_umc"                   "UMCSENT",   all
-    local short : subinstr local short "EOM_Close_de"                  "EOM",       all
-    local short : subinstr local short "GEPU_current_gepu"             "GEPU",      all
-    local short : subinstr local short "TPU_tpu"                       "TPU",       all
-    local short : subinstr local short "SBOI_nfibo"                    "SBOI",      all
-    local short : subinstr local short "UncertaintyIndex_nfibu"        "NFIBU",     all
-    local short : subinstr local short "SI_Dem_part"                   "SI_Dem",    all
-    local short : subinstr local short "SI_Ind_part"                   "SI_Ind",    all
-    local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
-    local short : subinstr local short "corn_vol_month"                "corn_mo",   all
-    local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
-	local short : subinstr local short "corn_close"                    "corn_px",   all
-    local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
-    local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
-	local short : subinstr local short "sb_close"                      "soy_px",    all
-    local short : subinstr local short "vix_vix"                       "VIX",       all
-
-    local star ""
-    if (p < .05) local star "*"
-
-post `PF' ("`v'") ("`short'") (b) (se) (t) (p) (r2) (NN) ("`star'") (b0) (se0)
-}
-postclose `PF'
-
-use "`HR'", clear
-order var short b se t p star r2 N const_b const_se 
-format b se %9.3g
-format const_b const_se %9.3g
-format t %8.2f
-format p %6.4f
-format r2 %6.4f
-format N  %9.0f
-
-export delimited using "$TAB\horse race.csv", replace
-
-*******************************************************
-* 6c) HORSE RACE — non-season vars w/o season controls
-*     + append season dummies as additional variables
-*     (N>=90, original order, star p<.05, short names)
-*******************************************************
-
-* Load diffs and ensure seasons are available for the seasons-only model
-use "$PROC\aebcorrsv3_diff.dta", clear
-format mdate %tm
-tsset mdate, monthly
+* Get seasons (if available, merge if needed)
 capture ds se_*
 if _rc | "`r(varlist)'"=="" {
     preserve
         tempfile _se
-        use "$PROC\aebcorrsv3.dta", clear
+        use "`DATA_MAIN'", clear
         keep mdate se_*
         duplicates drop mdate, force
         save "`_se'"
@@ -1033,150 +924,34 @@ if _rc | "`r(varlist)'"=="" {
     merge 1:1 mdate using "`_se'", nogen
 }
 
-* Dependent variable (prefer d_AEB_aeb; fallback d_AEB)
-local y ""
-capture confirm variable d_AEB_aeb
-if !_rc local y d_AEB_aeb
-else {
-    capture confirm variable d_AEB
-    if !_rc local y d_AEB
-}
-if "`y'"=="" {
-    di as err "Horse-race: missing d_AEB_aeb/d_AEB."
-    exit 111
-}
-
-* Candidate non-season predictors (dataset order): all d_* minus DV and d_mdate
-ds d_*, has(type numeric)
-local X `r(varlist)'
-local X : list X - `y'
-local X : list X - d_AEB_aeb
-local X : list X - d_AEB
-local X : list X - d_mdate
-local K : word count `X'
-if `K'==0 {
-    di as err "Horse-race: no candidate d_* predictors."
-    exit 111
-}
-
-* Seasons (for the seasons-only model); drop one base to avoid dummy trap
 ds se_*, has(type numeric)
 local SE `r(varlist)'
 local SE_nobase `SE'
 local SE_nobase : list SE_nobase - se_winter
-local dropped "se_winter"
-local nSE   : word count `SE'
-local nSEnb : word count `SE_nobase'
-if `nSE'==`nSEnb' & `nSE'>0 {
-    local base : word 1 of `SE'
-    local SE_nobase : list SE_nobase - `base'
-    local dropped "`base'"
-}
 
-* Collector
-tempfile HRs
-tempname PFs
-postfile `PFs' str64 var str32 short double b se t p r2 N str1 star ///
-    double const_b double const_se using "`HRs'", replace
+**** 8A) Horse Race - No Seasons ****
+horse_race_regression `X', yvar(`y') file("$TAB\horse race.csv") minn(`MIN_N')
 
-* ---- (A) One-at-a-time NON-SEASON regressions (NO season controls) ----
-forvalues j = 1/`K' {
-    local v : word `j' of `X'
-    quietly regress `y' `v', vce(robust)
-    if _rc | missing(e(N)) continue
-    if (e(N) < 90) continue
+**** 8B) Horse Race - No Season Controls + Append Seasons ****
+horse_race_regression `X', yvar(`y') file("$TAB\horse_race_seasons.csv") ///
+    minn(`MIN_N') appendseasons
 
-    scalar b   = _b[`v']
-    scalar se  = _se[`v']
-    scalar t   = b/se
-    scalar p   = 2*ttail(e(df_r), abs(t))
-    scalar r2  = e(r2)
-    scalar NN  = e(N)
-    scalar b0  = _b[_cons]
-    scalar se0 = _se[_cons]
+**** 8C) Horse Race - With Season Controls ****
+horse_race_regression `X', yvar(`y') file("$TAB\horse_race_ctrlseasons.csv") ///
+    seasons(`SE_nobase') minn(`MIN_N')
 
-    * Short names
-    local short "`v'"
-    local short : subinstr local short "News_Based_Policy_Uncert_Index" "EPU_news", all
-    local short : subinstr local short "CCI_monthly_cci"               "CCI",       all
-    local short : subinstr local short "UMCSENT_umc"                   "UMCSENT",   all
-    local short : subinstr local short "EOM_Close_de"                  "EOM",       all
-    local short : subinstr local short "GEPU_current_gepu"             "GEPU",      all
-    local short : subinstr local short "TPU_tpu"                       "TPU",       all
-    local short : subinstr local short "SBOI_nfibo"                    "SBOI",      all
-    local short : subinstr local short "UncertaintyIndex_nfibu"        "NFIBU",     all
-    local short : subinstr local short "SI_Dem_part"                   "SI_Dem",    all
-    local short : subinstr local short "SI_Ind_part"                   "SI_Ind",    all
-    local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
-    local short : subinstr local short "corn_vol_month"                "corn_mo",   all
-    local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
-	local short : subinstr local short "corn_close"                    "corn_px",   all
-    local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
-    local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
-	local short : subinstr local short "sb_close"                      "soy_px",    all
-    local short : subinstr local short "vix_vix"                       "VIX",       all
-
-    local star ""
-    if (p < .05) local star "*"
-
-    post `PFs' ("`v'") ("`short'") (b) (se) (t) (p) (r2) (NN) ("`star'") (b0) (se0)
-}
-
-* ---- (B) Append seasons as additional variables (from seasons-only model) ----
-if "`SE_nobase'" != "" {
-    quietly regress `y' `SE_nobase', vce(robust)
-    if !_rc & e(N) >= 90 {
-        scalar r2s  = e(r2)
-        scalar NNs  = e(N)
-        scalar b0s  = _b[_cons]
-        scalar se0s = _se[_cons]
-
-        foreach s of local SE_nobase {
-            * human-friendly short label for season
-            local sh "`s'"
-            local sh : subinstr local sh "se_spring" "Spring", all
-            local sh : subinstr local sh "se_summer" "Summer", all
-            local sh : subinstr local sh "se_fall"   "Fall",   all
-            local sh : subinstr local sh "se_winter" "Winter", all
-
-            capture scalar bs  = _b[`s']
-            capture scalar ses = _se[`s']
-            if _rc continue
-            scalar ts = bs/ses
-            scalar ps = 2*ttail(e(df_r), abs(ts))
-
-            local star ""
-            if (ps < .05) local star "*"
-
-            * NOTE: for season rows, use the season var/label and seasons-only stats
-            post `PFs' ("`s'") ("`sh'") (bs) (ses) (ts) (ps) (r2s) (NNs) ("`star'") (b0s) (se0s)
-        }
-    }
-}
-
-postclose `PFs'
-
-use "`HRs'", clear
-order var short b se t p star r2 N const_b const_se
-format b se %9.3g
-format const_b const_se %9.3g
-format t %8.2f
-format p %6.4f
-format r2 %6.4f
-format N  %9.0f
-
-export delimited using "$TAB\horse_race_seasons.csv", replace
+**** 8D) Horse Race - With Season Controls + Append Seasons ****
+horse_race_regression `X', yvar(`y') file("$TAB\horse_race_snlctrl+seasons.csv") ///
+    seasons(`SE_nobase') minn(`MIN_N') appendseasons
 
 *******************************************************
-* 6d) KITCHEN SINK — NO seasonal dummies; drop DV diffs
-*      + overfit diagnostics + tidy CSV export
+* SECTION 9: Kitchen Sink - NO Seasonal Dummies
 *******************************************************
-
-use "$PROC\aebcorrsv3_diff.dta", clear
+use "`DATA_DIFF'", clear
 format mdate %tm
 tsset mdate, monthly
 
-* ---- Dependent variable (prefer d_AEB_aeb; fallback d_AEB)
+* Dependent variable
 local y ""
 capture confirm variable d_AEB_aeb
 if !_rc local y d_AEB_aeb
@@ -1189,7 +964,7 @@ if "`y'"=="" {
     exit 111
 }
 
-* ---- Candidate predictors: build from d_* while explicitly skipping DV aliases + d_mdate
+* Build predictors
 ds d_*, has(type numeric)
 local rawX `r(varlist)'
 local X ""
@@ -1203,8 +978,7 @@ if `p0'==0 {
     exit 111
 }
 
-* ---- (Optional) remove zero-variance columns on the common sample
-* Build common sample indicator across y and all X
+* Remove zero-variance columns
 tempvar T
 gen byte `T' = !missing(`y')
 foreach v of local X {
@@ -1212,7 +986,7 @@ foreach v of local X {
 }
 count if `T'
 local Ncommon = r(N)
-* Drop predictors that are constant on the common sample
+
 local Xclean
 foreach v of local X {
     quietly summarize `v' if `T', meanonly
@@ -1220,31 +994,18 @@ foreach v of local X {
 }
 local X "`Xclean'"
 
-* Double-check: ensure the dependent variable (or its aliases) are not in X
-local DV_present : list X & `y'
-if "`DV_present'" != "" {
-    di as err "Kitchen sink (no seasons): dropping DV `y' from predictors to avoid R2=1."
-    local X : list X - `y'
-}
-* Also guard against alternate DV alias accidentally persisting
-local DV_aliases "d_AEB_aeb d_AEB"
-local drop_alias : list X & DV_aliases
-if "`drop_alias'" != "" {
-    local X : list X - `drop_alias'
-}
-
-* ---- Fit kitchen-sink (NO seasons), robust SEs
+* Fit kitchen-sink (NO seasons)
 quietly regress `y' `X', vce(robust)
 
-* ---- Quick diagnostics for overfitting
-local p_used = e(rank) - 1   // parameters excluding intercept
+* Quick diagnostics
+local p_used = e(rank) - 1
 local df_r   = e(df_r)
 di as res "Kitchen-sink (NO seasons) | N=" %9.0f e(N) "  p_used≈" %3.0f `p_used' ///
           "  df_r=" %6.0f `df_r' "  R2=" %6.4f e(r2) "  adjR2=" %6.4f e(r2_a)
 if (e(r2) >= .9999) di as err ">>> R2≈1: likely overfit or perfect linear combo present."
 if (e(df_r) <= 5)   di as err ">>> Very low residual dof: p too large vs N (risk of overfit)."
 
-* ---- Export tidy coefficient table WITH model stats: $TAB\kitchen_sink.csv
+* Export coefficient table
 tempfile KS
 tempname PF
 
@@ -1265,29 +1026,9 @@ foreach v of local cn {
     scalar tt = bb/ss
     scalar pp = 2*ttail(e(df_r), abs(tt))
     local star ""
-    if (pp < .05) local star "*"
+    if (pp < `ALPHA') local star "*"
 
-    * short names (same scheme as before)
-    local short "`v'"
-    local short : subinstr local short "News_Based_Policy_Uncert_Index" "EPU_news", all
-    local short : subinstr local short "CCI_monthly_cci"               "CCI",       all
-    local short : subinstr local short "UMCSENT_umc"                   "UMCSENT",   all
-    local short : subinstr local short "EOM_Close_de"                  "EOM",       all
-    local short : subinstr local short "GEPU_current_gepu"             "GEPU",      all
-    local short : subinstr local short "TPU_tpu"                       "TPU",       all
-    local short : subinstr local short "SBOI_nfibo"                    "SBOI",      all
-    local short : subinstr local short "UncertaintyIndex_nfibu"        "NFIBU",     all
-    local short : subinstr local short "SI_Dem_part"                   "SI_Dem",    all
-    local short : subinstr local short "SI_Ind_part"                   "SI_Ind",    all
-    local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
-    local short : subinstr local short "corn_vol_month"                "corn_mo",   all
-    local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
-	local short : subinstr local short "corn_close"                    "corn_px",   all
-    local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
-    local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
-	local short : subinstr local short "sb_close"                      "soy_px",    all
-    local short : subinstr local short "vix_vix"                       "VIX",       all
-    local short : subinstr local short "_cons"                         "Intercept", all
+    map_short_names, var("`v'") return(short)
 
     post `PF' ("`v'") ("`short'") (bb) (ss) (tt) (pp) ("`star'") (R2) (AR2) (NN) (RMSE)
 }
@@ -1303,290 +1044,4 @@ format N %9.0f
 format rmse %9.3g
 export delimited using "$TAB\kitchen_sink_noseasons.csv", replace
 
-
-*******************************************************
-* 6e) HORSE RACE — with seasonal dummies as controls
-*     (N>=90, original order, star p<.05, short names)
-*******************************************************
-
-* Always load the diff dataset for robustness
-use "$PROC\aebcorrsv3_diff.dta", clear
-format mdate %tm
-tsset mdate, monthly
-
-* If seasons aren't here, merge them in from levels file
-capture ds se_*
-if _rc | "`r(varlist)'"=="" {
-    preserve
-        tempfile _se
-        use "$PROC\aebcorrsv3.dta", clear
-        keep mdate se_*
-        duplicates drop mdate, force
-        save "`_se'"
-    restore
-    merge 1:1 mdate using "`_se'", nogen
-}
-
-* ---- Dependent variable (prefer d_AEB_aeb; fallback d_AEB)
-local y ""
-capture confirm variable d_AEB_aeb
-if !_rc local y d_AEB_aeb
-else {
-    capture confirm variable d_AEB
-    if !_rc local y d_AEB
-}
-if "`y'"=="" {
-    di as err "Horse-race (seasons): could not find d_AEB_aeb or d_AEB. Build the diff file first."
-    exit 111
-}
-
-* ---- Build X list in dataset order: all d_* minus DV and d_mdate
-ds d_*, has(type numeric)
-local rawX `r(varlist)'
-local X ""
-foreach v of local rawX {
-    if inlist("`v'", "`y'", "d_AEB_aeb", "d_AEB", "d_mdate") continue
-    local X `X' `v'
-}
-local K : word count `X'
-if `K'==0 {
-    di as err "Horse-race (seasons): no candidate d_* predictors found."
-    exit 111
-}
-
-* ---- Season controls (drop one base to avoid dummy trap)
-ds se_*, has(type numeric)
-local SE `r(varlist)'
-local SE_nobase `SE'
-local SE_nobase : list SE_nobase - se_winter
-local nSE   : word count `SE'
-local nSEnb : word count `SE_nobase'
-if `nSE'==`nSEnb' & `nSE'>0 {
-    local base : word 1 of `SE'
-    local SE_nobase : list SE_nobase - `base'
-}
-
-* ---- Collect results
-tempfile HRs
-tempname PFs
-postfile `PFs' str64 var str32 short double b se t p r2 N str1 star ///
-    double const_b double const_se double p_seasons using "`HRs'", replace
-
-forvalues j = 1/`K' {
-    local v : word `j' of `X'
-
-    quietly regress `y' `v' `SE_nobase', vce(robust)
-    if _rc | missing(e(N)) continue
-     if (e(N) < 90) continue
-
-    scalar pS = .
-    if "`SE_nobase'" != "" {
-        quietly testparm `SE_nobase'
-        scalar pS = r(p)
-    }
-    scalar b   = _b[`v']
-    scalar se  = _se[`v']
-    scalar t   = b/se
-    scalar p   = 2*ttail(e(df_r), abs(t))
-    scalar r2  = e(r2)
-    scalar NN  = e(N)
-    scalar b0  = .
-    capture scalar b0 = _b[_cons]
-    scalar se0 = .
-    capture scalar se0 = _se[_cons]
-
-    * Short names
-    local short "`v'"
-    local short : subinstr local short "News_Based_Policy_Uncert_Index" "EPU_news", all
-    local short : subinstr local short "CCI_monthly_cci"               "CCI",       all
-    local short : subinstr local short "UMCSENT_umc"                   "UMCSENT",   all
-    local short : subinstr local short "EOM_Close_de"                  "EOM",       all
-    local short : subinstr local short "GEPU_current_gepu"             "GEPU",      all
-    local short : subinstr local short "TPU_tpu"                       "TPU",       all
-    local short : subinstr local short "SBOI_nfibo"                    "SBOI",      all
-    local short : subinstr local short "UncertaintyIndex_nfibu"        "NFIBU",     all
-    local short : subinstr local short "SI_Dem_part"                   "SI_Dem",    all
-    local short : subinstr local short "SI_Ind_part"                   "SI_Ind",    all
-    local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
-    local short : subinstr local short "corn_vol_month"                "corn_mo",   all
-    local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
-	    local short : subinstr local short "corn_close"                    "corn_px",   all
-    local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
-    local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
-	    local short : subinstr local short "sb_close"                      "soy_px",    all
-    local short : subinstr local short "vix_vix"                       "VIX",       all
-
-    local star ""
-    if (p < .05) local star "*"
-
-	  post `PFs' ("`v'") ("`short'") (b) (se) (t) (p) (r2) (NN) ("`star'") (b0) (se0) (pS)
-}
-postclose `PFs'
-
-use "`HRs'", clear
-order var short b se t p star r2 N const_b const_se p_seasons
-format b se %9.3g
-format const_b const_se %9.3g
-format t %8.2f
-format p %6.4f
-format r2 %6.4f
-format N  %9.0f
-
-export delimited using "$TAB\horse_race_ctrlseasons.csv", replace
-
-*******************************************************
-* 6f) HORSE RACE — with seasonal dummies as controls
-*     + append seasons as additional variables (rows)
-*     (N>=90, original order, star p<.05, short names)
-*******************************************************
-clear all
-* Load diffs and make sure seasons exist
-use "$PROC\aebcorrsv3_diff.dta", clear
-format mdate %tm
-tsset mdate, monthly
-
-capture ds se_*
-if _rc | "`r(varlist)'"=="" {
-    preserve
-        tempfile _se
-        use "$PROC\aebcorrsv3.dta", clear
-        keep mdate se_*
-        duplicates drop mdate, force
-        save "`_se'"
-    restore
-    merge 1:1 mdate using "`_se'", nogen
-}
-
-* Dependent variable (prefer d_AEB_aeb; fallback d_AEB)
-local y ""
-capture confirm variable d_AEB_aeb
-if !_rc local y d_AEB_aeb
-else {
-    capture confirm variable d_AEB
-    if !_rc local y d_AEB
-}
-if "`y'"=="" {
-    di as err "Horse-race (seasons): missing d_AEB_aeb/d_AEB."
-    exit 111
-}
-
-* Candidate X in dataset order: all d_* minus DV and d_mdate
-ds d_*, has(type numeric)
-local rawX `r(varlist)'
-local X ""
-foreach v of local rawX {
-    if inlist("`v'", "`y'", "d_AEB_aeb", "d_AEB", "d_mdate") continue
-    local X `X' `v'
-}
-local K : word count `X'
-if `K'==0 {
-    di as err "Horse-race (seasons): no candidate d_* predictors."
-    exit 111
-}
-
-* Seasons (drop one base to avoid dummy trap)
-ds se_*, has(type numeric)
-local SE `r(varlist)'
-local SE_nobase `SE'
-local SE_nobase : list SE_nobase - se_winter
-local dropped "se_winter"
-local nSE   : word count `SE'
-local nSEnb : word count `SE_nobase'
-if `nSE'==`nSEnb' & `nSE'>0 {
-    local base : word 1 of `SE'
-    local SE_nobase : list SE_nobase - `base'
-    local dropped "`base'"
-}
-
-* Results collector
-tempfile HRs
-tempname PFs
-postfile `PFs' str64 var str32 short double b se t p r2 N str1 star ///
-    double const_b double const_se using "`HRs'", replace
-
-* ---- (A) One-at-a-time predictors WITH season controls ----
-forvalues j = 1/`K' {
-    local v : word `j' of `X'
-    quietly regress `y' `v' `SE_nobase', vce(robust)
-    if _rc | missing(e(N)) continue
-    if (e(N) < 90) continue
-
-    scalar b   = _b[`v']
-    scalar se  = _se[`v']
-    scalar t   = b/se
-    scalar p   = 2*ttail(e(df_r), abs(t))
-    scalar r2  = e(r2)
-    scalar NN  = e(N)
-    scalar b0  = .
-    capture scalar b0 = _b[_cons]
-    scalar se0 = .
-    capture scalar se0 = _se[_cons]
-
-    * Short names
-    local short "`v'"
-    local short : subinstr local short "News_Based_Policy_Uncert_Index" "EPU_news", all
-    local short : subinstr local short "CCI_monthly_cci"               "CCI",       all
-    local short : subinstr local short "UMCSENT_umc"                   "UMCSENT",   all
-    local short : subinstr local short "EOM_Close_de"                  "EOM",       all
-    local short : subinstr local short "GEPU_current_gepu"             "GEPU",      all
-    local short : subinstr local short "TPU_tpu"                       "TPU",       all
-    local short : subinstr local short "SBOI_nfibo"                    "SBOI",      all
-    local short : subinstr local short "UncertaintyIndex_nfibu"        "NFIBU",     all
-    local short : subinstr local short "SI_Dem_part"                   "SI_Dem",    all
-    local short : subinstr local short "SI_Ind_part"                   "SI_Ind",    all
-    local short : subinstr local short "SI_Rep_part"                   "SI_Rep",    all
-    local short : subinstr local short "corn_vol_month"                "corn_mo",   all
-    local short : subinstr local short "corn_vol_ann"                  "corn_ann",  all
-    local short : subinstr local short "corn_close"                    "corn_px",   all
-    local short : subinstr local short "sb_vol_month"                  "soy_mo",    all
-    local short : subinstr local short "sb_vol_ann"                    "soy_ann",   all
-    local short : subinstr local short "sb_close"                      "soy_px",    all
-    local short : subinstr local short "vix_vix"                       "VIX",       all
-
-    local star ""
-    if (p < .05) local star "*"
-
-    post `PFs' ("`v'") ("`short'") (b) (se) (t) (p) (r2) (NN) ("`star'") (b0) (se0)
-}
-
-* ---- (B) Append the season dummies as additional variables (rows) ----
-if "`SE_nobase'" != "" {
-    quietly regress `y' `SE_nobase', vce(robust)
-    if !_rc & e(N)>=90 {
-        scalar r2s = e(r2)
-        scalar NNs = e(N)
-        scalar b0s = .
-        capture scalar b0s = _b[_cons]
-        scalar se0s = .
-        capture scalar se0s = _se[_cons]
-        foreach s of local SE_nobase {
-            local sh "`s'"
-            local sh : subinstr local sh "se_spring" "Spring", all
-            local sh : subinstr local sh "se_summer" "Summer", all
-            local sh : subinstr local sh "se_fall"   "Fall",   all
-            local sh : subinstr local sh "se_winter" "Winter", all
-
-            capture scalar bs  = _b[`s']
-            capture scalar ses = _se[`s']
-            if _rc continue
-            scalar ts = bs/ses
-            scalar ps = 2*ttail(e(df_r), abs(ts))
-            local star ""
-            if (ps < .05) local star "*"
-            post `PFs' ("`s'") ("`sh'") (bs) (ses) (ts) (ps) (r2s) (NNs) ("`star'") (b0s) (se0s)
-        }
-    }
-}
-
-postclose `PFs'
-
-use "`HRs'", clear
-order var short b se t p star r2 N const_b const_se
-format b se %9.3g
-format const_b const_se %9.3g
-format t %8.2f
-format p %6.4f
-format r2 %6.4f
-format N  %9.0f
-
-export delimited using "$TAB\horse_race_snlctrl+seasons.csv", replace
+di as result "🎉 Analysis complete!"
