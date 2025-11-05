@@ -254,7 +254,7 @@ end
 capture program drop horse_race_regression
 program define horse_race_regression
     syntax varlist, Yvar(string) file(string) ///
-        [SEasons(string) MINn(integer 90) APpendseasons]
+        [SEasons(string) MINn(integer 90) ALpha(real 0.05) APpendseasons]
 
     * Count predictors
     local K : word count `varlist'
@@ -305,7 +305,7 @@ program define horse_race_regression
         map_short_names, var("`v'") return(short)
 
         local star ""
-        if (p < `ALPHA') local star "*"
+        if (p < `alpha') local star "*"
 
         if "`seasons'" != "" {
             post `PF' ("`v'") ("`short'") (b) (se) (t) (p) (r2) (NN) ("`star'") (b0) (se0) (pS)
@@ -336,7 +336,7 @@ program define horse_race_regression
                 scalar ps = 2*ttail(e(df_r), abs(ts))
 
                 local star ""
-                if (ps < `ALPHA') local star "*"
+                if (ps < `alpha') local star "*"
 
                 if "`seasons'" != "" {
                     post `PF' ("`s'") ("`sh'") (bs) (ses) (ts) (ps) (r2s) (NNs) ("`star'") (b0s) (se0s) (.)
@@ -932,19 +932,19 @@ local SE_nobase `SE'
 local SE_nobase : list SE_nobase - se_winter
 
 **** 8A) Horse Race - No Seasons ****
-horse_race_regression `X', yvar(`y') file("$TAB\horse race.csv") minn(`MIN_N')
+horse_race_regression `X', yvar(`y') file("$TAB\horse race.csv") minn(`MIN_N') alpha(`ALPHA')
 
 **** 8B) Horse Race - No Season Controls + Append Seasons ****
 horse_race_regression `X', yvar(`y') file("$TAB\horse_race_seasons.csv") ///
-    minn(`MIN_N') appendseasons
+    minn(`MIN_N') alpha(`ALPHA') appendseasons
 
 **** 8C) Horse Race - With Season Controls ****
 horse_race_regression `X', yvar(`y') file("$TAB\horse_race_ctrlseasons.csv") ///
-    seasons(`SE_nobase') minn(`MIN_N')
+    seasons(`SE_nobase') minn(`MIN_N') alpha(`ALPHA')
 
 **** 8D) Horse Race - With Season Controls + Append Seasons ****
 horse_race_regression `X', yvar(`y') file("$TAB\horse_race_snlctrl+seasons.csv") ///
-    seasons(`SE_nobase') minn(`MIN_N') appendseasons
+    seasons(`SE_nobase') minn(`MIN_N') alpha(`ALPHA') appendseasons
 
 *******************************************************
 * SECTION 9: Kitchen Sink - NO Seasonal Dummies
