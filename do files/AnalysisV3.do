@@ -22,6 +22,14 @@ if "$PROC" == "" {
     di as err "Global macro PROC is not defined. Please set it before running this script."
     exit 111
 }
+if "$TAB" == "" {
+    di as err "Global macro TAB is not defined. Please set it before running this script."
+    exit 111
+}
+if "$FIG" == "" {
+    di as err "Global macro FIG is not defined. Please set it before running this script."
+    exit 111
+}
 
 *******************************************************
 * HELPER PROGRAMS
