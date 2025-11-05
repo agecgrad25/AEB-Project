@@ -709,44 +709,30 @@ preserve
 restore
 
 **************************************************************
-* F) PCA + FA for FIRST DIFFERENCES (d_)
+* F) PCA + FA for FIRST DIFFERENCES (d_) — Nominal data only
 **************************************************************
 preserve
-    * Load the main dataset
-    use "$PROC\aebcorrsv3.dta", clear
+    * Load the first differences dataset
+    use "$PROC\aebcorrsv3_diff.dta", clear
+
+    * Ensure mdate exists and set time
+    capture confirm variable mdate
+    if _rc {
+        di as err "mdate missing in aebcorrsv3_diff.dta"
+        exit 459
+    }
+    format mdate %tm
     tsset mdate, monthly
 
-    * Get list of numeric variables (exclude mdate and seasons)
-    ds, has(type numeric)
-    local allnum `r(varlist)'
-    local allnum : list allnum - mdate
-    ds se_*, has(type numeric)
-    local seasons `r(varlist)'
-    local nums_noseason : list allnum - seasons
-
-    * Create first differences for all numeric variables (except mdate and seasons)
-    local diff_vars ""
-    foreach v of local nums_noseason {
-        capture drop d_`v'
-        quietly gen double d_`v' = D.`v'
-        local diff_vars `diff_vars' d_`v'
+    * Build list of first difference variables (d_*)
+    capture unab diff_vars : d_*
+    if _rc {
+        di as error "No first difference variables (d_*) found in aebcorrsv3_diff.dta"
+        exit 111
     }
-
-    di as result "=== First Differences Variables Created ==="
-    di as result "Variables: `diff_vars'"
 
     * Remove d_AEB_aeb from the list for PCA/FA analysis
     local diff_vars_nopxs : list diff_vars - d_AEB_aeb
-
-    * Drop observations with missing first differences (first observation will be missing)
-    quietly {
-        foreach v of local diff_vars_nopxs {
-            capture confirm variable `v'
-            if !_rc {
-                drop if missing(`v')
-            }
-        }
-    }
 
     * Count how many variables we have
     local p_diff : word count `diff_vars_nopxs'
@@ -759,8 +745,14 @@ preserve
         local ncomp_diff = cond(`p_diff' >= 3, 3, `p_diff')
 
         di as result "=== PCA/FA on First Differences (d_) ==="
+        di as result "Variables included: `diff_vars_nopxs'"
         di as result "Number of variables: `p_diff'"
         di as result "Number of components: `ncomp_diff'"
+
+        * Describe and summarize the data
+        quietly describe `diff_vars_nopxs'
+        quietly summarize `diff_vars_nopxs'
+        quietly corr `diff_vars_nopxs'
 
         * Save current data to tempfile for reloading after exports
         tempfile diff_data
@@ -784,6 +776,10 @@ preserve
         * Rotate and export loadings
         rotate, varimax
         rotate, varimax blanks(.3)
+        rotate, clear
+        rotate, promax
+        rotate, promax blanks(.3)
+        rotate, clear
 
         estat loadings
         matrix L_pca_diff = e(L)
@@ -818,8 +814,6 @@ preserve
         * KMO test
         estat kmo
 
-        rotate, clear
-
         * ===== Factor Analysis on First Differences =====
         di as result "Running Factor Analysis on first differences..."
 
@@ -838,6 +832,10 @@ preserve
         * Rotate and export loadings
         rotate, varimax
         rotate, varimax blanks(.3)
+        rotate, clear
+        rotate, promax
+        rotate, promax blanks(.3)
+        rotate, clear
 
         estat common
         matrix L_fa_diff = e(L)
@@ -874,8 +872,6 @@ preserve
         cap which factortest
         if _rc ssc install factortest, replace
         factortest `diff_vars_nopxs'
-
-        rotate, clear
 
         * ===== Save First Differences PCA/FA Scores =====
         local have_diff ""
