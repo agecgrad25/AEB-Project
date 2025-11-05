@@ -1,0 +1,785 @@
+*******************************************************
+* 03_analysis_simple_v19.do — simple (Stata 19)
+* Input: $PROC\aebcorrsv3.dta  (post-2014, +corn/soy prices & vols, +Seasons)*******************************************************
+
+version 19.0
+clear all
+set more off
+
+* 0) Load and set time
+use "$PROC\aebcorrsv3.dta", clear
+capture confirm variable mdate
+if _rc {
+    di as err "mdate missing"
+    exit 459
+}
+format mdate %tm
+tsset mdate, monthly
+
+* Suffix for all outputs in this run
+local SUF "_v3"
+
+* Ensure AEB_aeb exists (only AEB series in this dataset)
+capture confirm variable AEB_aeb
+if _rc {
+    di as err "AEB_aeb not found in the dataset."
+    exit 111
+}
+
+* Pre-OLS safeguards: drop any lingering standardized AEB so it cannot be reused
+capture drop z_AEB_aeb
+
+* Helper: ensure an AEB-free snapshot exists for RAW PCA/FA routines
+capture program drop build_aebcorrsv3pca
+program define build_aebcorrsv3pca
+    syntax
+
+    preserve
+        quietly use "$PROC\aebcorrsv3.dta", clear
+
+        * Remove AEB-specific series and any standardized z_* remnants
+        capture drop AEB_aeb
+        capture drop AEB
+        capture drop z_*
+
+        compress
+        save "$PROC\aebcorrsv3pca.dta", replace
+    restore
+end
+
+quietly build_aebcorrsv3pca
+
+* Identify numeric vars; exclude mdate and SEASON dummies (no Fourier terms exist)
+ds, has(type numeric)
+local allnum `r(varlist)'
+local allnum : list allnum - mdate
+ds se_*, has(type numeric)
+local seasons `r(varlist)'
+
+* Keep a "no-season" numeric set for transforms/analyses
+local nums_noseason : list allnum - seasons
+
+* Snapshot without AEB_aeb for PCA/FA work (used later in section 5)
+tempfile aebcorrsv3pca
+preserve
+    drop AEB_aeb
+    save `aebcorrsv3pca'
+restore
+*******************************************************
+* 1) Z-score all numeric vars (exclude mdate, seasons)
+*******************************************************
+local zbase `nums_noseason'
+foreach v of local zbase {
+    if "`v'" == "AEB_aeb" continue
+    capture drop z_`v'
+    quietly egen z_`v' = std(`v')
+}
+
+
+
+**************************************************************
+* 2) Correlations — include seasons + export full matrix
+**************************************************************
+* Build clean lists
+ds se_*, has(type numeric)
+local seasons `r(varlist)'
+
+* Non-season numerics (used for z_ counterparts in pairwise)
+local others `nums_noseason'
+local others : list others - mdate
+local others : list others - AEB_aeb
+
+* Keep only vars that actually have z_ counterparts
+local safe_others
+foreach v of local others {
+    capture confirm variable z_`v'
+    if !_rc local safe_others `safe_others' `v'
+}
+
+* ------------ 2A) Pairwise correlations ------------
+preserve
+    tempfile out
+    tempname ph
+    postfile `ph' str64 var double rho int N using "`out'", replace
+    * Non-season variables — correlate nominal series (no z_)
+    foreach v of local safe_others {
+        quietly corr AEB_aeb `v'
+        post `ph' ("`v'") (r(rho)) (r(N))
+    }
+
+    * Season dummies (still pair with nominal AEB_aeb)
+    if "`seasons'" != "" {
+        foreach s of local seasons {
+            quietly corr AEB_aeb `s'
+            post `ph' ("`s'") (r(rho)) (r(N))
+        }
+    }
+
+    postclose `ph'
+
+    use "`out'", clear
+    drop if missing(rho)
+
+    quietly count
+    if r(N) == 0 {
+        di as txt "No valid pairwise correlations between AEB_aeb and the candidate variables."
+    }
+    else {
+        gen double abs_rho = abs(rho)
+        gsort -abs_rho
+
+        order var rho N
+        format rho %6.3f
+        format N   %9.0f
+
+        export delimited using "$TAB\T_corr_pairwise`SUF'.csv", replace
+        drop abs_rho
+    }
+restore
+
+* ------------ 2B) Full correlation matrix (incl. seasons) ------------
+* Build matrix varlist without AEB_aeb (per pre-OLS exclusion)
+local tmp `nums_noseason'
+local tmp : list tmp - AEB_aeb
+local CMAT "`tmp' `seasons'"
+
+if trim("`CMAT'") == "" {
+    di as txt "No variables available for correlation matrix once AEB_aeb is excluded."
+}
+else {
+    quietly corr `CMAT'
+    matrix C = r(C)
+
+* --- Make column names legal, <=32 chars, and UNIQUE to satisfy svmat
+local cols : colnames C
+local safe ""
+local used ""
+local i = 0
+foreach c of local cols {
+    local ++i
+    local base = strtoname("`c'")
+    if strlen("`base'")>28 local base = substr("`base'",1,28)
+    local nm "`base'"
+    local k = 1
+    while strpos(" `used' "," `nm' ") {
+        local suffix _`k'
+        local slen : length local suffix
+        local blen = 32 - `slen'
+        if `blen' < 1 local blen = 1
+        local nm = substr("`base'",1,`blen')
+        local nm "`nm'`suffix'"
+        local ++k
+    }
+    local used `used' `nm'
+    local safe `safe' `nm'
+}
+matrix colnames C = `safe'
+
+preserve
+    clear
+    svmat double C, names(col)
+    gen variable = ""
+    local rn : rownames C
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_corr_full`SUF'.csv", replace
+restore
+}
+
+*****************************************************************
+* 3) (Optional) Rolling 24-month correlations (exclude seasons)
+*****************************************************************
+cap which rangestat
+if _rc ssc install rangestat, replace
+
+preserve
+    use "$PROC\aebcorrsv3.dta", clear
+    tsset mdate, monthly
+
+    ds, has(type numeric)
+    local allnum `r(varlist)'
+    local allnum : list allnum - mdate
+    ds se_*, has(type numeric)
+    local seasons `r(varlist)'
+    local nums_noseason : list allnum - seasons
+
+    * Rebuild z_ for these only
+    local zbase `nums_noseason'
+    foreach v of local zbase {
+        capture drop z_`v'
+        quietly egen z_`v' = std(`v')
+    }
+
+    * Rolling targets: no mdate/AEB_aeb; must have z_ partner
+    local others `nums_noseason'
+    local others : list others - mdate
+    local others : list others - AEB_aeb
+
+    local safe_others
+    foreach v of local others {
+        capture confirm variable z_`v'
+        if !_rc {
+            local safe_others `safe_others' `v'
+        }
+    }
+
+    * ---- Rolling correlations
+    foreach v of local safe_others {
+        tempvar prod mx my mxy sx sy
+        gen double `prod' = z_AEB_aeb * z_`v'
+        rangestat (mean) `mx'=z_AEB_aeb `my'=z_`v' `mxy'=`prod' ///
+                  (sd)   `sx'=z_AEB_aeb `sy'=z_`v', interval(mdate -23 0)
+
+        local base = strtoname("`v'")
+        local maxbase = 32 - `=strlen("r_AEB_aeb_")'
+        if strlen("`base'") > `maxbase' {
+            local base = substr("`base'", 1, `maxbase')
+        }
+        local rname = "r_AEB_aeb_`base'"
+        capture confirm variable `rname'
+        local k = 1
+        while !_rc {
+            local rname = "r_AEB_aeb_`base'_`k'"
+            local ++k
+            capture confirm variable `rname'
+        }
+
+        capture drop `rname'
+        gen double `rname' = (`mxy' - `mx'*`my') / (`sx'*`sy')
+        replace    `rname' = . if (`sx'==0 | `sy'==0)
+        drop `prod' `mx' `my' `mxy' `sx' `sy'
+    }
+
+    order mdate, first
+    compress
+    save "$PROC\monthly_rollingcorrs_simple`SUF'.dta", replace
+restore
+
+**************************************************************
+* 4) (Optional) Quick chart for one rolling series
+**************************************************************
+use "$PROC\monthly_rollingcorrs_simple`SUF'.dta", clear
+local target r_AEB_aeb_News_Based_Policy_Uncert_Index
+capture confirm variable `target'
+if _rc {
+    capture unab _cands : r_AEB_aeb_*
+    if !_rc {
+        local target : word 1 of `_cands'
+    }
+}
+capture confirm variable `target'
+if !_rc {
+    twoway tsline `target', ///
+        title("Rolling 24m corr: AEB_aeb vs selected") ytitle("corr") xtitle("")
+    graph export "$FIG\F3_roll_AEBaeb_selected`SUF'.png", replace width(1600)
+}
+capture unab rvars : r_*
+if !_rc {
+    drop `rvars'
+}
+
+
+**************************************************************
+* 5) PCA + FA — auto-build varlists (include corn/sb vols)
+**************************************************************
+* Build RAW = all numeric except mdate, seasons, z_* and AEB_aeb
+ds, has(type numeric)
+local Xraw `r(varlist)'
+local Xraw : list Xraw - mdate
+local Xraw : list Xraw - seasons
+local Xraw : list Xraw - AEB_aeb
+capture unab zvars : z_*
+if !_rc {
+    local Xraw : list Xraw - zvars
+}
+
+* Build Z = all z_* constructed above
+capture unab Z : z_*
+if _rc local Z ""
+local Z : list Z - z_AEB_aeb
+
+local p_z : word count `Z'
+local ncomp_z = cond(`p_z' >= 3, 3, `p_z')
+local p_snap = 0
+
+*******************************************************
+* A) RAW (nominal) variables
+*******************************************************
+preserve
+    use "$PROC\aebcorrsv3pca.dta", clear
+
+    * Build raw list directly from the snapshot
+    ds, has(type numeric)
+    local Xsnap `r(varlist)'
+    local Xsnap : list Xsnap - mdate
+
+    ds se_*, has(type numeric)
+    local seasons_snap `r(varlist)'
+    local Xsnap : list Xsnap - seasons_snap
+
+    capture unab drop_z : z_*
+    if !_rc local Xsnap : list Xsnap - drop_z
+
+    local Xsnap : list Xsnap - AEB_aeb
+    local Xsnap : list Xsnap - AEB
+    local Xsnap : list retoken Xsnap
+
+    local p_snap : word count `Xsnap'
+    if `p_snap' < 2 {
+        di as txt "No variables available for RAW PCA/FA snapshot once exclusions applied."
+    }
+    else {
+        local ncomp_snap = cond(`p_snap' >= 3, 3, `p_snap')
+
+        quietly describe `Xsnap'
+        quietly summarize `Xsnap'
+        quietly corr `Xsnap'
+
+        * PCA (RAW) on snapshot vars
+        pca `Xsnap'
+        screeplot, name(G_scree_raw, replace)
+        screeplot, yline(1) name(G_scree_raw_y1, replace)
+        pca `Xsnap', mineigen(1)
+        pca `Xsnap', comp(`ncomp_snap')
+        pca `Xsnap', comp(`ncomp_snap') blanks(.3)
+        rotate, varimax
+        rotate, varimax blanks(.3)
+        rotate, clear
+        rotate, promax
+        rotate, promax blanks(.3)
+        rotate, clear
+
+        estat loadings
+        matrix L_pca_raw = e(L)
+        
+            clear
+            svmat double L_pca_raw, names(col)
+            gen variable = ""
+            local rn : rownames L_pca_raw
+            local i = 1
+            foreach r of local rn {
+                replace variable = "`r'" in `i'
+                local ++i
+            }
+            order variable
+            export delimited using "$TAB\T_loadings_pca_raw_varimax`SUF'.csv", replace
+        restore
+
+        * PCA scores -> *_raw
+        local pcs_raw
+        forvalues i = 1/`ncomp_snap' {
+            local pcs_raw `pcs_raw' pc`i'
+        }
+        capture drop `pcs_raw'
+        predict `pcs_raw', score
+        foreach v of local pcs_raw {
+            rename `v' `v'_raw
+        }
+
+        * KMO
+        estat kmo
+
+        * FACTOR (RAW)
+        factor `Xsnap'
+        screeplot, name(G_scree_raw_fa, replace)
+        screeplot, yline(1) name(G_scree_raw_fa_y1, replace)
+        factor `Xsnap', mineigen(1)
+        factor `Xsnap', factor(`ncomp_snap')
+        factor `Xsnap', factor(`ncomp_snap') blanks(0.3)
+        rotate, varimax
+        rotate, varimax blanks(.3)
+        rotate, clear
+        rotate, promax
+        rotate, promax blanks(.3)
+        rotate, clear
+
+        estat common
+        matrix L_fa_raw = e(L)
+        preserve
+            clear
+            svmat double L_fa_raw, names(col)
+            gen variable = ""
+            local rn : rownames L_fa_raw
+            local i = 1
+            foreach r of local rn {
+                replace variable = "`r'" in `i'
+                local ++i
+            }
+            order variable
+            export delimited using "$TAB\T_loadings_fa_raw_varimax`SUF'.csv", replace
+        restore
+
+        * FA scores -> *_raw
+        local fs_raw
+        forvalues i = 1/`ncomp_snap' {
+            local fs_raw `fs_raw' f`i'
+        }
+        capture drop `fs_raw'
+        predict `fs_raw'
+        foreach v of local fs_raw {
+            rename `v' `v'_raw
+        }
+
+        * Reliability + Bartlett (RAW)
+        alpha `Xsnap'
+        cap which factortest
+        if _rc ssc install factortest, replace
+        factortest `Xsnap'
+
+        * Save raw PCA/FA scores from the snapshot
+        local have_raw ""
+        capture unab have_raw : pc*_raw f*_raw
+        if !_rc {
+            preserve
+                keep mdate `have_raw'
+                compress
+                save "$PROC\fa_pca_scores_raw`SUF'.dta", replace
+            restore
+            di as result "✅ Saved: $PROC\fa_pca_scores_raw`SUF'.dta"
+        }
+    }
+
+if (`p_snap' < 2 & `p_z' < 2) {
+    di as err "Not enough variables for PCA/FA."
+    exit 111
+}
+
+*******************************************************
+* B) STANDARDIZED (z_) variables
+*******************************************************
+if `p_z' >= 2 {
+    quietly describe `Z'
+    quietly summarize `Z'
+    quietly corr `Z'
+
+    * PCA (Z)
+    pca `Z'
+    screeplot, name(G_scree_z, replace)
+    screeplot, yline(1) name(G_scree_z_y1, replace)
+    pca `Z', mineigen(1)
+    pca `Z', comp(`ncomp_z')
+    pca `Z', comp(`ncomp_z') blanks(.3)
+    rotate, varimax
+
+    estat loadings
+    matrix L_pca_z = e(L)
+    preserve
+        clear
+        svmat double L_pca_z, names(col)
+        gen variable = ""
+        local rn : rownames L_pca_z
+        local i = 1
+        foreach r of local rn {
+            replace variable = "`r'" in `i'
+            local ++i
+        }
+        order variable
+        export delimited using "$TAB\T_loadings_pca_z_varimax`SUF'.csv", replace
+    restore
+
+    * PCA scores -> *_z
+    local pcs_z
+    forvalues i = 1/`ncomp_z' {
+        local pcs_z `pcs_z' pc`i'
+    }
+    capture drop `pcs_z'
+    predict `pcs_z', score
+    foreach v of local pcs_z {
+        rename `v' `v'_z
+    }
+
+    * KMO
+    estat kmo
+
+    * FACTOR (Z)
+    factor `Z'
+    screeplot, name(G_scree_z_fa, replace)
+    screeplot, yline(1) name(G_scree_z_fa_y1, replace)
+    factor `Z', mineigen(1)
+    factor `Z', factor(`ncomp_z')
+    factor `Z', factor(`ncomp_z') blanks(0.3)
+    rotate, varimax
+
+    estat common
+    matrix L_fa_z = e(L)
+    preserve
+        clear
+        svmat double L_fa_z, names(col)
+        gen variable = ""
+        local rn : rownames L_fa_z
+        local i = 1
+        foreach r of local rn {
+            replace variable = "`r'" in `i'
+            local ++i
+        }
+        order variable
+        export delimited using "$TAB\T_loadings_fa_z_varimax`SUF'.csv", replace
+    restore
+
+    * FA scores -> *_z
+    local fs_z
+    forvalues i = 1/`ncomp_z' {
+        local fs_z `fs_z' f`i'
+    }
+    capture drop `fs_z'
+    predict `fs_z'
+    foreach v of local fs_z {
+        rename `v' `v'_z
+    }
+
+    * Reliability + Bartlett (Z)
+    alpha `Z'
+    cap which factortest
+    if _rc ssc install factortest, replace
+    factortest `Z'
+}
+
+**************************************************************
+* C) Save tidy score files — robust to missing scores
+**************************************************************
+* RAW scores
+local have_raw ""
+capture unab have_raw : pc*_raw f*_raw
+if !_rc {
+    preserve
+        keep mdate `have_raw'
+        compress
+        save "$PROC\fa_pca_scores_raw`SUF'.dta", replace
+    restore
+}
+
+* Z scores
+local have_z ""
+capture unab have_z : pc*_z f*_z
+if !_rc {
+    preserve
+        keep mdate `have_z'
+        compress
+        save "$PROC\fa_pca_scores_z`SUF'.dta", replace
+    restore
+}
+
+**************************************************************
+* D) PCA + FA WITHOUT corn_close and sb_close (nopxs)
+**************************************************************
+preserve
+    * Load the aebcorrsv3pca dataset
+    use "$PROC\aebcorrsv3pca.dta", clear
+
+    * Drop corn_close and sb_close
+    drop corn_close sb_close
+
+    * Drop mdate and season dummies for analysis
+    drop mdate se_spring se_summer se_fall se_winter
+
+    * Get list of remaining variables for PCA/FA
+    ds
+    local varlist_nopxs `r(varlist)'
+
+    di as result "=== PCA/FA without corn_close and sb_close ==="
+    di as result "Variables included: `varlist_nopxs'"
+
+    * Save current data to tempfile for reloading after exports
+    tempfile nopxs_data
+    save `nopxs_data', replace
+
+    * Run PCA using Kaiser criterion (eigenvalue > 1)
+    pca `varlist_nopxs', mineigen(1)
+    rotate, varimax blanks(.3)
+
+    * Export PCA loadings
+    estat loadings
+    matrix L_pca_nopxs = e(L)
+
+    clear
+    svmat double L_pca_nopxs, names(col)
+    gen variable = ""
+    local rn : rownames L_pca_nopxs
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_loadings_pca_nopxs`SUF'.csv", replace
+    di as result "Saved: $TAB\T_loadings_pca_nopxs`SUF'.csv"
+
+    * Reload data for FA
+    use `nopxs_data', clear
+
+    * Run Factor Analysis using Kaiser criterion (eigenvalue > 1)
+    factor `varlist_nopxs', mineigen(1)
+    rotate, varimax blanks(.3)
+
+    * Export FA loadings
+    estat common
+    matrix L_fa_nopxs = e(L)
+
+    clear
+    svmat double L_fa_nopxs, names(col)
+    gen variable = ""
+    local rn : rownames L_fa_nopxs
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_loadings_fa_nopxs`SUF'.csv", replace
+    di as result "Saved: $TAB\T_loadings_fa_nopxs`SUF'.csv"
+
+restore
+
+**************************************************************
+* E) PCA + FA for Z-SCORED variables WITHOUT corn/soy prices (z_nopxs)
+**************************************************************
+preserve
+    * Load the main dataset with z-scored variables
+    use "$PROC\aebcorrsv3.dta", clear
+
+    * Keep only z_* variables
+    keep mdate z_*
+
+    * Drop z_AEB_aeb, z_corn_close, and z_sb_close
+    drop z_AEB_aeb z_corn_close z_sb_close
+
+    * Drop mdate for analysis
+    drop mdate
+
+    * Get list of remaining z-scored variables for PCA/FA
+    ds
+    local varlist_z_nopxs `r(varlist)'
+
+    di as result "=== PCA/FA for z-scored variables without corn/soy prices ==="
+    di as result "Variables included: `varlist_z_nopxs'"
+
+    * Save current data to tempfile for reloading after exports
+    tempfile z_nopxs_data
+    save `z_nopxs_data', replace
+
+    * Run PCA using Kaiser criterion (eigenvalue > 1)
+    pca `varlist_z_nopxs', mineigen(1)
+    rotate, varimax blanks(.3)
+
+    * Export PCA loadings
+    estat loadings
+    matrix L_pca_z_nopxs = e(L)
+
+    clear
+    svmat double L_pca_z_nopxs, names(col)
+    gen variable = ""
+    local rn : rownames L_pca_z_nopxs
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_loadings_pca_z_nopxs`SUF'.csv", replace
+    di as result "Saved: $TAB\T_loadings_pca_z_nopxs`SUF'.csv"
+
+    * Reload data for FA
+    use `z_nopxs_data', clear
+
+    * Run Factor Analysis using Kaiser criterion (eigenvalue > 1)
+    factor `varlist_z_nopxs', mineigen(1)
+    rotate, varimax blanks(.3)
+
+    * Export FA loadings
+    estat common
+    matrix L_fa_z_nopxs = e(L)
+
+    clear
+    svmat double L_fa_z_nopxs, names(col)
+    gen variable = ""
+    local rn : rownames L_fa_z_nopxs
+    local i = 1
+    foreach r of local rn {
+        replace variable = "`r'" in `i'
+        local ++i
+    }
+    order variable
+    export delimited using "$TAB\T_loadings_fa_z_nopxs`SUF'.csv", replace
+    di as result "Saved: $TAB\T_loadings_fa_z_nopxs`SUF'.csv"
+
+restore
+
+**************************************************************
+* 6) Single–Factor "AEB-like" index (RAW and Z)
+**************************************************************
+local p_raw : word count `Xraw'
+local p_z   : word count `Z'
+
+* RAW single factor
+if `p_raw' >= 2 {
+    factor `Xraw', factor(1)
+    matrix L_fa1_raw = e(L)
+    preserve
+        clear
+        svmat double L_fa1_raw, names(col)
+        gen variable = ""
+        local rn : rownames L_fa1_raw
+        local i = 1
+        foreach r of local rn {
+            replace variable = "`r'" in `i'
+            local ++i
+        }
+        order variable
+        export delimited using "$TAB\T_loadings_fa1_raw`SUF'.csv", replace
+    restore
+
+    capture drop F1_raw
+    predict F1_raw
+    di as txt "Skipping F1_raw sign alignment with AEB_aeb prior to OLS."
+    rename F1_raw AEB_like_raw
+    preserve
+        keep mdate AEB_like_raw
+        compress
+        save "$PROC\fa1_scores_raw`SUF'.dta", replace
+    restore
+}
+
+* Z single factor
+if `p_z' >= 2 {
+    factor `Z', factor(1)
+    matrix L_fa1_z = e(L)
+    preserve
+        clear
+        svmat double L_fa1_z, names(col)
+        gen variable = ""
+        local rn : rownames L_fa1_z
+        local i = 1
+        foreach r of local rn {
+            replace variable = "`r'" in `i'
+            local ++i
+        }
+        order variable
+        export delimited using "$TAB\T_loadings_fa1_z`SUF'.csv", replace
+    restore
+
+    capture drop F1_z
+    predict F1_z
+    di as txt "Skipping F1_z sign alignment with z_AEB_aeb prior to OLS."
+    rename F1_z AEB_like_z
+    preserve
+        keep mdate AEB_like_z
+        compress
+        save "$PROC\fa1_scores_z`SUF'.dta", replace
+    restore
+}
+
+* Optional CSV exports of single-factor series
+foreach which in raw z {
+    capture confirm file "$PROC\fa1_scores_`which'`SUF'.dta"
+    if !_rc {
+        preserve
+            use "$PROC\fa1_scores_`which'`SUF'.dta", clear
+            export delimited using "$TAB\T_fa1_scores_`which'`SUF'.csv", replace
+        restore
+    }
+}
+
