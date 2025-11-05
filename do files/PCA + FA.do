@@ -785,20 +785,23 @@ preserve
         matrix L_pca_diff = e(L)
 
         * Export PCA loadings
-        preserve
-            clear
-            svmat double L_pca_diff, names(col)
-            gen variable = ""
-            local rn : rownames L_pca_diff
-            local i = 1
-            foreach r of local rn {
-                replace variable = "`r'" in `i'
-                local ++i
-            }
-            order variable
-            export delimited using "$TAB\T_loadings_pca_diff`SUF'.csv", replace
-            di as result "Saved: $TAB\T_loadings_pca_diff`SUF'.csv"
-        restore
+        tempfile pca_state
+        save `pca_state', replace
+        clear
+        svmat double L_pca_diff, names(col)
+        gen variable = ""
+        local rn : rownames L_pca_diff
+        local i = 1
+        foreach r of local rn {
+            replace variable = "`r'" in `i'
+            local ++i
+        }
+        order variable
+        export delimited using "$TAB\T_loadings_pca_diff`SUF'.csv", replace
+        di as result "Saved: $TAB\T_loadings_pca_diff`SUF'.csv"
+
+        * Reload data for PCA scores
+        use `pca_state', clear
 
         * Extract PCA scores
         local pcs_diff
@@ -841,20 +844,23 @@ preserve
         matrix L_fa_diff = e(L)
 
         * Export FA loadings
-        preserve
-            clear
-            svmat double L_fa_diff, names(col)
-            gen variable = ""
-            local rn : rownames L_fa_diff
-            local i = 1
-            foreach r of local rn {
-                replace variable = "`r'" in `i'
-                local ++i
-            }
-            order variable
-            export delimited using "$TAB\T_loadings_fa_diff`SUF'.csv", replace
-            di as result "Saved: $TAB\T_loadings_fa_diff`SUF'.csv"
-        restore
+        tempfile fa_state
+        save `fa_state', replace
+        clear
+        svmat double L_fa_diff, names(col)
+        gen variable = ""
+        local rn : rownames L_fa_diff
+        local i = 1
+        foreach r of local rn {
+            replace variable = "`r'" in `i'
+            local ++i
+        }
+        order variable
+        export delimited using "$TAB\T_loadings_fa_diff`SUF'.csv", replace
+        di as result "Saved: $TAB\T_loadings_fa_diff`SUF'.csv"
+
+        * Reload data for FA scores
+        use `fa_state', clear
 
         * Extract FA scores
         local fs_diff
@@ -877,19 +883,20 @@ preserve
         local have_diff ""
         capture unab have_diff : pc*_diff f*_diff
         if !_rc {
-            preserve
-                keep mdate `have_diff'
-                compress
-                save "$PROC\fa_pca_scores_diff`SUF'.dta", replace
-                di as result "✅ Saved: $PROC\fa_pca_scores_diff`SUF'.dta"
-            restore
+            tempfile scores_state
+            save `scores_state', replace
+
+            keep mdate `have_diff'
+            compress
+            save "$PROC\fa_pca_scores_diff`SUF'.dta", replace
+            di as result "✅ Saved: $PROC\fa_pca_scores_diff`SUF'.dta"
 
             * Export to CSV as well
-            preserve
-                keep mdate `have_diff'
-                export delimited using "$TAB\T_fa_pca_scores_diff`SUF'.csv", replace
-                di as result "✅ Saved: $TAB\T_fa_pca_scores_diff`SUF'.csv"
-            restore
+            export delimited using "$TAB\T_fa_pca_scores_diff`SUF'.csv", replace
+            di as result "✅ Saved: $TAB\T_fa_pca_scores_diff`SUF'.csv"
+
+            * Reload original data
+            use `scores_state', clear
         }
     }
 restore
