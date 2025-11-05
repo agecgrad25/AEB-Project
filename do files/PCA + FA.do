@@ -709,6 +709,196 @@ preserve
 restore
 
 **************************************************************
+* F) PCA + FA for FIRST DIFFERENCES (d_)
+**************************************************************
+preserve
+    * Load the main dataset
+    use "$PROC\aebcorrsv3.dta", clear
+    tsset mdate, monthly
+
+    * Get list of numeric variables (exclude mdate and seasons)
+    ds, has(type numeric)
+    local allnum `r(varlist)'
+    local allnum : list allnum - mdate
+    ds se_*, has(type numeric)
+    local seasons `r(varlist)'
+    local nums_noseason : list allnum - seasons
+
+    * Create first differences for all numeric variables (except mdate and seasons)
+    local diff_vars ""
+    foreach v of local nums_noseason {
+        capture drop d_`v'
+        quietly gen double d_`v' = D.`v'
+        local diff_vars `diff_vars' d_`v'
+    }
+
+    di as result "=== First Differences Variables Created ==="
+    di as result "Variables: `diff_vars'"
+
+    * Remove d_AEB_aeb from the list for PCA/FA analysis
+    local diff_vars_nopxs : list diff_vars - d_AEB_aeb
+
+    * Drop observations with missing first differences (first observation will be missing)
+    quietly {
+        foreach v of local diff_vars_nopxs {
+            capture confirm variable `v'
+            if !_rc {
+                drop if missing(`v')
+            }
+        }
+    }
+
+    * Count how many variables we have
+    local p_diff : word count `diff_vars_nopxs'
+
+    if `p_diff' < 2 {
+        di as error "Not enough first difference variables for PCA/FA analysis"
+    }
+    else {
+        * Determine number of components (Kaiser criterion or max 3)
+        local ncomp_diff = cond(`p_diff' >= 3, 3, `p_diff')
+
+        di as result "=== PCA/FA on First Differences (d_) ==="
+        di as result "Number of variables: `p_diff'"
+        di as result "Number of components: `ncomp_diff'"
+
+        * Save current data to tempfile for reloading after exports
+        tempfile diff_data
+        save `diff_data', replace
+
+        * ===== PCA on First Differences =====
+        di as result "Running PCA on first differences..."
+
+        * Basic PCA with all eigenvalues
+        pca `diff_vars_nopxs'
+        screeplot, name(G_scree_diff, replace)
+        screeplot, yline(1) name(G_scree_diff_y1, replace)
+
+        * PCA with Kaiser criterion
+        pca `diff_vars_nopxs', mineigen(1)
+
+        * PCA with specified number of components
+        pca `diff_vars_nopxs', comp(`ncomp_diff')
+        pca `diff_vars_nopxs', comp(`ncomp_diff') blanks(.3)
+
+        * Rotate and export loadings
+        rotate, varimax
+        rotate, varimax blanks(.3)
+
+        estat loadings
+        matrix L_pca_diff = e(L)
+
+        * Export PCA loadings
+        preserve
+            clear
+            svmat double L_pca_diff, names(col)
+            gen variable = ""
+            local rn : rownames L_pca_diff
+            local i = 1
+            foreach r of local rn {
+                replace variable = "`r'" in `i'
+                local ++i
+            }
+            order variable
+            export delimited using "$TAB\T_loadings_pca_diff`SUF'.csv", replace
+            di as result "Saved: $TAB\T_loadings_pca_diff`SUF'.csv"
+        restore
+
+        * Extract PCA scores
+        local pcs_diff
+        forvalues i = 1/`ncomp_diff' {
+            local pcs_diff `pcs_diff' pc`i'
+        }
+        capture drop `pcs_diff'
+        predict `pcs_diff', score
+        foreach v of local pcs_diff {
+            rename `v' `v'_diff
+        }
+
+        * KMO test
+        estat kmo
+
+        rotate, clear
+
+        * ===== Factor Analysis on First Differences =====
+        di as result "Running Factor Analysis on first differences..."
+
+        * Basic FA with all eigenvalues
+        factor `diff_vars_nopxs'
+        screeplot, name(G_scree_diff_fa, replace)
+        screeplot, yline(1) name(G_scree_diff_fa_y1, replace)
+
+        * FA with Kaiser criterion
+        factor `diff_vars_nopxs', mineigen(1)
+
+        * FA with specified number of factors
+        factor `diff_vars_nopxs', factor(`ncomp_diff')
+        factor `diff_vars_nopxs', factor(`ncomp_diff') blanks(0.3)
+
+        * Rotate and export loadings
+        rotate, varimax
+        rotate, varimax blanks(.3)
+
+        estat common
+        matrix L_fa_diff = e(L)
+
+        * Export FA loadings
+        preserve
+            clear
+            svmat double L_fa_diff, names(col)
+            gen variable = ""
+            local rn : rownames L_fa_diff
+            local i = 1
+            foreach r of local rn {
+                replace variable = "`r'" in `i'
+                local ++i
+            }
+            order variable
+            export delimited using "$TAB\T_loadings_fa_diff`SUF'.csv", replace
+            di as result "Saved: $TAB\T_loadings_fa_diff`SUF'.csv"
+        restore
+
+        * Extract FA scores
+        local fs_diff
+        forvalues i = 1/`ncomp_diff' {
+            local fs_diff `fs_diff' f`i'
+        }
+        capture drop `fs_diff'
+        predict `fs_diff'
+        foreach v of local fs_diff {
+            rename `v' `v'_diff
+        }
+
+        * Reliability and Bartlett test
+        alpha `diff_vars_nopxs'
+        cap which factortest
+        if _rc ssc install factortest, replace
+        factortest `diff_vars_nopxs'
+
+        rotate, clear
+
+        * ===== Save First Differences PCA/FA Scores =====
+        local have_diff ""
+        capture unab have_diff : pc*_diff f*_diff
+        if !_rc {
+            preserve
+                keep mdate `have_diff'
+                compress
+                save "$PROC\fa_pca_scores_diff`SUF'.dta", replace
+                di as result "✅ Saved: $PROC\fa_pca_scores_diff`SUF'.dta"
+            restore
+
+            * Export to CSV as well
+            preserve
+                keep mdate `have_diff'
+                export delimited using "$TAB\T_fa_pca_scores_diff`SUF'.csv", replace
+                di as result "✅ Saved: $TAB\T_fa_pca_scores_diff`SUF'.csv"
+            restore
+        }
+    }
+restore
+
+**************************************************************
 * 6) Single–Factor "AEB-like" index (RAW and Z)
 **************************************************************
 local p_raw : word count `Xraw'
