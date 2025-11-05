@@ -17,9 +17,11 @@ local ROLL_WINDOW 24
 local BLANK_THRESH 0.3
 local N_COMPONENTS 3
 
-local DATA_MAIN "$PROC\aebcorrsv3.dta"
-local DATA_DIFF "$PROC\aebcorrsv3_diff.dta"
-local DATA_PCA  "$PROC\aebcorrsv3pca.dta"
+* Verify required global macros are defined
+if "$PROC" == "" {
+    di as err "Global macro PROC is not defined. Please set it before running this script."
+    exit 111
+}
 
 *******************************************************
 * HELPER PROGRAMS
@@ -371,7 +373,7 @@ end
 *******************************************************
 * SECTION 0: Load and set time
 *******************************************************
-use "`DATA_MAIN'", clear
+use "$PROC\aebcorrsv3.dta", clear
 capture confirm variable mdate
 if _rc {
     di as err "mdate missing"
@@ -514,7 +516,7 @@ cap which rangestat
 if _rc ssc install rangestat, replace
 
 preserve
-    use "`DATA_MAIN'", clear
+    use "$PROC\aebcorrsv3.dta", clear
     tsset mdate, monthly
 
     get_clean_varlist, return(nums_noseason) noseasons
@@ -607,7 +609,7 @@ local ncomp_z = cond(`p_z' >= `N_COMPONENTS', `N_COMPONENTS', `p_z')
 
 **** 5A) RAW (nominal) variables ****
 preserve
-    use "`DATA_PCA'", clear
+    use "$PROC\aebcorrsv3pca.dta", clear
 
     * Build raw list from snapshot
     get_clean_varlist, return(Xsnap) noseasons noz noaeb
@@ -662,7 +664,7 @@ if `p_z' >= 2 {
 
 **** 5D) PCA + FA WITHOUT corn_close and sb_close (nopxs) ****
 preserve
-    use "`DATA_PCA'", clear
+    use "$PROC\aebcorrsv3pca.dta", clear
     drop corn_close sb_close mdate se_spring se_summer se_fall se_winter
 
     ds
@@ -694,7 +696,7 @@ restore
 
 **** 5E) PCA + FA for Z-SCORED variables WITHOUT corn/soy prices (z_nopxs) ****
 preserve
-    use "`DATA_MAIN'", clear
+    use "$PROC\aebcorrsv3.dta", clear
     keep mdate z_*
     drop z_AEB_aeb z_corn_close z_sb_close mdate
 
@@ -779,7 +781,7 @@ foreach which in raw z {
 *******************************************************
 * SECTION 7: OLS - Kitchen Sink with Seasons
 *******************************************************
-use "`DATA_DIFF'", clear
+use "$PROC\aebcorrsv3_diff.dta", clear
 format mdate %tm
 tsset mdate, monthly
 
@@ -889,7 +891,7 @@ export delimited using "$TAB\kitchen_sink.csv", replace
 *******************************************************
 
 * Load differenced data
-use "`DATA_DIFF'", clear
+use "$PROC\aebcorrsv3_diff.dta", clear
 format mdate %tm
 tsset mdate, monthly
 
@@ -916,7 +918,7 @@ capture ds se_*
 if _rc | "`r(varlist)'"=="" {
     preserve
         tempfile _se
-        use "`DATA_MAIN'", clear
+        use "$PROC\aebcorrsv3.dta", clear
         keep mdate se_*
         duplicates drop mdate, force
         save "`_se'"
@@ -947,7 +949,7 @@ horse_race_regression `X', yvar(`y') file("$TAB\horse_race_snlctrl+seasons.csv")
 *******************************************************
 * SECTION 9: Kitchen Sink - NO Seasonal Dummies
 *******************************************************
-use "`DATA_DIFF'", clear
+use "$PROC\aebcorrsv3_diff.dta", clear
 format mdate %tm
 tsset mdate, monthly
 
